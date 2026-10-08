@@ -40,7 +40,14 @@ scatter / permute is needed** — routing overhead is zero.
 - **Timing:** CUDA-graph capture + replay, 30 iterations after 5 warmup runs.
 - **All inputs BF16, accumulators FP32.**
 
-### Results
+### Historical results (fixed reference configuration)
+
+The tables below were measured with the original fixed Triton reference
+configuration. The current benchmark instead uses SGLang's standard config
+lookup (`try_get_optimal_moe_config`, with original batch size `M=B`) and
+calls the standard `fused_experts` path for end-to-end timing. These historical
+speedups do not describe the current default SGLang baseline.
+
 
 Times are per-call, in milliseconds. `speedup = sglang_ms / warp_decode_ms`.
 
@@ -206,8 +213,9 @@ shapes — dominated by BF16 output quantization, not accumulator error).
 
 ```bash
 # From the repo root — the kernels are JIT-compiled on the first import.
-python warp_decode/tests/test_gate_up_correctness.py
-python warp_decode/tests/test_down_correctness.py
+python tests/test_gate_up_correctness.py
+python tests/test_down_correctness.py
+python tests/test_benchmark_reference.py
 ```
 
 The initial import triggers an `nvcc` build under
@@ -216,21 +224,37 @@ The initial import triggers an `nvcc` build under
 Set `WARP_DECODE_VERBOSE=1` to see the `nvcc` invocation on rebuild:
 
 ```bash
-WARP_DECODE_VERBOSE=1 python warp_decode/tests/test_gate_up_correctness.py
+WARP_DECODE_VERBOSE=1 python tests/test_gate_up_correctness.py
 ```
 
 ### Benchmark
 
 ```bash
 # All three modes, Qwen3-235B TP=8 defaults, batch 1..64
-python warp_decode/benchmark/bench.py
+python benchmark/bench.py
 
 # One mode only, custom batch set
-python warp_decode/benchmark/bench.py --mode e2e --batches 1,8,16,32,64
+python benchmark/bench.py --mode e2e --batches 1,8,16,32,64
 
 # Custom shape (e.g. TP=4)
-python warp_decode/benchmark/bench.py --tp-size 4 --batches 1..32
+python benchmark/bench.py --tp-size 4 --batches 1..32
 ```
+
+The SGLang reference uses the installed package's tuned config lookup and
+fallback rules for the GPU, weight shapes, and original batch size. Gate/up
+and down use their respective standard configs. End-to-end timing calls
+SGLang's standard Triton `fused_experts`, including routing, activation, and
+combine. The script prints the selected configs; SGLang logs any missing-config
+fallback. It requires the current `moe_runner.triton_utils` API.
+
+Routing selects distinct experts per token. Activation buffers use logical
+`B * topk` rows, and the isolated down benchmark uses the same initialized
+activation as warp_decode. Its timing includes routing, down projection, and
+SGLang's standard combine kernels. If a selected down config requires sorted
+TMA activations, use `--mode e2e` to benchmark that standard path.
+
+`tests/test_benchmark_reference.py` checks staged-versus-standard output,
+FP32-reference accuracy, and CUDA Graph replay with updated inputs/routing.
 
 ### Python API
 
