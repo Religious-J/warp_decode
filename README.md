@@ -24,75 +24,82 @@ scatter / permute is needed** — routing overhead is zero.
 
 ---
 
-## Reproducing Cursor's claim on Hopper
+## Performance on Hopper
 
 ### Setup
 
-- **GPU:** NVIDIA H20 (Hopper, sm_90). HBM3 peak ≈ 4 TB/s.
-- **Model shape:** Qwen3-235B-A22B under TP=8
-  - `hidden = 4096`
-  - `intermediate_size_per_expert = 1536`, TP-sharded to `inter = 192`
-  - `num_experts = 128`, `topk = 8`
-- **Reference:** the sglang fused-MoE path from
-  `tests/bench_bf16_fuse_moe.py` (`moe_align_block_size` → triton
-  `invoke_fused_moe_kernel` gate_up → `silu_and_mul` → triton
-  `invoke_fused_moe_kernel` down → topk-weighted sum-reduce).
-- **Timing:** CUDA-graph capture + replay, 30 iterations after 5 warmup runs.
-- **All inputs BF16, accumulators FP32.**
+- **GPU:** NVIDIA H20 (Hopper, sm_90).
+- **Software:** PyTorch 2.11.0+cu130, CUDA toolkit 13.0.88, SGLang 0.5.13.post1.
+- **Shape:** Qwen3-235B-A22B-style MoE FFN under TP=8:
+  `hidden=4096`, `inter=192` (1536 before TP split), `num_experts=128`, `topk=8`.
+- **Reference:** SGLang's standard Triton configuration lookup and
+  `fused_experts` end-to-end path. Configurations are selected using the original
+  batch size `M=B`; gate/up and down use their respective standard configurations.
+- **Routing:** eight distinct experts per token, with normalized FP32 routing weights.
+- **Timing:** CUDA Graph replay, 25 warmup calls and 200 timed calls per run.
+  Latencies are medians of three runs; speedups are calculated from those medians.
+- **Precision:** BF16 activations and weights, FP32 accumulators.
+
+For this environment, SGLang falls back to its bundled Triton 3.2.0 H20
+configuration. There is no dedicated down configuration for this shape, so
+SGLang uses its standard gate/up configuration fallback.
 
 ### Results
 
-Times are per-call, in milliseconds. `speedup = sglang_ms / warp_decode_ms`.
+Times are per call in milliseconds. `speedup = sglang_ms / warp_decode_ms`.
+SGLang stage timings include expert alignment. Both implementations receive
+precomputed top-k IDs and weights, so router computation is excluded. The
+end-to-end benchmark measures gate/up, activation, down, and expert combination
+in one call. Stage timings are measured separately and should not be added to
+estimate end-to-end latency.
 
-**gate_up + `silu_and_mul`:**
+**Gate/up + SiLU activation:**
 
-| batch | tokens | warp_decode | sglang triton | speedup |
-| ----: | -----: | ----------: | ------------: | ------: |
-|     1 |      8 |      0.0078 |        0.0222 |   2.84x |
-|     2 |     16 |      0.0144 |        0.0351 |   2.43x |
-|     4 |     32 |      0.0334 |        0.0465 |   1.39x |
-|     8 |     64 |      0.0541 |        0.0680 |   1.26x |
-|    16 |    128 |      0.0890 |        0.0912 |   1.02x |
-|    32 |    256 |      0.1594 |        0.2015 |   1.26x |
-|    48 |    384 |      0.2223 |        0.2305 |   1.04x |
-|    64 |    512 |      0.2840 |        0.2300 |   0.81x |
+| batch | tokens | warp_decode (ms) | SGLang Triton (ms) | speedup |
+| ----: | -----: | ---------------: | -----------------: | ------: |
+| 1 | 8 | 0.0075 | 0.0199 | 2.65x |
+| 2 | 16 | 0.0148 | 0.0319 | 2.16x |
+| 4 | 32 | 0.0315 | 0.0405 | 1.29x |
+| 8 | 64 | 0.0528 | 0.0648 | 1.23x |
+| 16 | 128 | 0.0849 | 0.0911 | 1.07x |
+| 32 | 256 | 0.1451 | 0.1184 | 0.82x |
+| 64 | 512 | 0.2760 | 0.1322 | 0.48x |
 
-**down + topk sum-reduce:**
+**Down + top-k weighted sum:**
 
-| batch | tokens | warp_decode | sglang triton | speedup |
-| ----: | -----: | ----------: | ------------: | ------: |
-|     1 |      8 |      0.0101 |        0.0158 |   1.56x |
-|     2 |     16 |      0.0118 |        0.0208 |   1.76x |
-|     4 |     32 |      0.0196 |        0.0301 |   1.53x |
-|     8 |     64 |      0.0384 |        0.0474 |   1.23x |
-|    16 |    128 |      0.0664 |        0.0696 |   1.05x |
+| batch | tokens | warp_decode (ms) | SGLang Triton (ms) | speedup |
+| ----: | -----: | ---------------: | -----------------: | ------: |
+| 1 | 8 | 0.0101 | 0.0168 | 1.66x |
+| 2 | 16 | 0.0115 | 0.0225 | 1.96x |
+| 4 | 32 | 0.0205 | 0.0270 | 1.32x |
+| 8 | 64 | 0.0391 | 0.0447 | 1.14x |
+| 16 | 128 | 0.0632 | 0.0579 | 0.92x |
+| 32 | 256 | 0.1170 | 0.0880 | 0.75x |
+| 64 | 512 | 0.2286 | 0.0816 | 0.36x |
 
-**End-to-end MoE FFN (gate_up + down):**
+**End-to-end MoE FFN:**
 
-| batch | tokens | warp_decode | sglang triton | speedup |
-| ----: | -----: | ----------: | ------------: | ------: |
-|     1 |      8 |      0.0207 |        0.0411 |   1.98x |
-|     2 |     16 |      0.0370 |        0.0562 |   1.52x |
-|     4 |     32 |      0.0555 |        0.0731 |   1.32x |
-|     8 |     64 |      0.0974 |        0.1126 |   1.16x |
-|    16 |    128 |      0.1580 |        0.1727 |   1.09x |
-|    32 |    256 |      0.2853 |        0.2898 |   1.02x |
+| batch | tokens | warp_decode (ms) | SGLang Triton (ms) | speedup |
+| ----: | -----: | ---------------: | -----------------: | ------: |
+| 1 | 8 | 0.0232 | 0.0348 | 1.50x |
+| 2 | 16 | 0.0350 | 0.0510 | 1.46x |
+| 4 | 32 | 0.0511 | 0.0633 | 1.24x |
+| 8 | 64 | 0.0878 | 0.0953 | 1.09x |
+| 16 | 128 | 0.1430 | 0.1475 | 1.03x |
+| 32 | 256 | 0.2682 | 0.1983 | 0.74x |
+| 64 | 512 | 0.5187 | 0.2047 | 0.39x |
 
-### What this shows
+### Interpretation
 
-**Cursor's claim reproduces on Hopper.** For decode-heavy batches
-(`B * topk / E_local < 1`, i.e. per-expert token count below the ridge-point
-of the roofline), the output-centric design gives a consistent speedup — up
-to **~2x on batch 1** and staying ahead of the reference until roughly
-`B = 32`. Above `B ≈ 48` the arithmetic intensity of an expert-centric grouped
-GEMM starts to dominate and the reference wins, which is exactly the regime
-where Cursor also recommends the traditional expert-centric path.
+For this shape on H20, warp_decode is faster at small batch sizes: the
+end-to-end speedup is 1.50x at batch 1 and 1.09x at batch 8. Batch 16 is close
+to parity (1.03x), while the standard SGLang reference is faster at batches
+32 and 64. The gate/up kernel remains slightly faster at batch 16, but the
+down kernel is already slower than its reference.
 
-The crossover point predicted by roofline analysis is
-`B_crit ≈ E_local / topk = 128 / 8 = 16`. In practice we see the e2e crossover
-around `B = 32`, slightly beyond the pure-roofline prediction because the
-warp_decode kernels also eliminate the routing/permute overhead that the
-reference has to pay unconditionally.
+These measurements support using warp_decode for small-batch decode. The
+crossover depends on the shape, routing distribution, GPU, and SGLang
+configuration; it should be measured for the intended workload.
 
 ---
 
@@ -165,13 +172,16 @@ The design that actually works on Hopper is very different:
   `#pragma unroll`-ed so the compiler can hoist all the loads and overlap
   them with the FMAs.
 
-**Result of these two changes** (Qwen3 TP=8, batch 16):
+**Development measurements** (Qwen3 TP=8, batch 16):
 
-| version                                        | down time | vs sglang |
-| ---------------------------------------------- | --------: | --------: |
-| v1: 1 warp / output, smem-staged buffer        |  0.143 ms |     0.49× |
-| v2, `OUTS_PER_WARP = 2`, no smem               |  0.097 ms |     0.72× |
-| v2, `OUTS_PER_WARP = 8`, fully unrolled (now)  |  0.066 ms |     1.05× |
+| version | down time |
+| ------- | --------: |
+| v1: 1 warp / output, smem-staged buffer | 0.143 ms |
+| v2: `OUTS_PER_WARP = 2`, no smem | 0.097 ms |
+| v2: `OUTS_PER_WARP = 8`, fully unrolled | 0.066 ms |
+
+These earlier measurements illustrate the effect of the kernel design changes.
+The performance tables above use the current standard SGLang reference.
 
 The `OUTS_PER_WARP` sweep on H20 showed 8 is the sweet spot: 4 leaves
 input-side arithmetic intensity on the table, 16 pushes register pressure
@@ -179,16 +189,20 @@ past the point where occupancy falls off and the B=1 CTA count halves.
 
 ### Numerical accuracy
 
-Both kernels keep activations in BF16 and accumulate in FP32 the whole way.
-In particular, the down kernel folds `topk_scale` into the accumulator in
-FP32 *before* the final BF16 conversion, so the topk-weighted sum does not
-suffer an intermediate rounding step — which mirrors the accuracy argument in
-Cursor's original blog.
+Both kernels use BF16 activations and weights with FP32 accumulators. The
+gate/up kernel converts operands to FP32 before multiplication and applies
+SiLU in FP32 before writing BF16 output. The down kernel uses BF16 `__hmul2`
+products, then converts those products to FP32 for accumulation. It applies
+`topk_scale` and sums across experts in FP32 before the final BF16 conversion;
+the BF16 products still introduce rounding before accumulation.
 
-Correctness is checked against a pure-PyTorch BF16 reference (see
-`warp_decode/tests/`). All shapes we support match to within BF16 precision
-(`atol=5e-2, rtol=5e-2`, but observed `max_abs_diff ≈ 5e-4` on Qwen3
-shapes — dominated by BF16 output quantization, not accumulator error).
+The kernel tests compare against PyTorch BF16 references with
+`atol=5e-2, rtol=5e-2`. In the tested Qwen3-style cases, the largest observed
+absolute differences were approximately 0.0039 for gate/up and 0.00049 for
+down. The standard-reference test also checks exact agreement between the
+staged SGLang reference and `fused_experts`, FP32-reference accuracy, and CUDA
+Graph replay with changed inputs and routing. All 20 test cases passed in
+the environment listed above.
 
 ---
 
@@ -196,41 +210,53 @@ shapes — dominated by BF16 output quantization, not accumulator error).
 
 ### Requirements
 
-- Linux with CUDA 12.x + a Hopper GPU (sm_90). Tested on **H20 + CUDA 12.9**.
+- Linux, a CUDA toolkit compatible with the installed PyTorch build, and a
+  Hopper GPU (sm_90). The benchmark above was tested on H20 with CUDA 13.0.
 - PyTorch (with matching CUDA build) — the kernels are JIT-compiled via
   `torch.utils.cpp_extension.load`, no separate build step is needed.
-- For the benchmark script only: `sglang` and `sgl-kernel` (used as the
-  reference implementation).
+- For the benchmark and `test_benchmark_reference.py`: `sglang` and `sgl-kernel`.
+  The standard reference was tested with SGLang 0.5.13.post1 and requires its
+  `moe_runner.triton_utils` API.
 
 ### Install & first run
 
 ```bash
 # From the repo root — the kernels are JIT-compiled on the first import.
-python warp_decode/tests/test_gate_up_correctness.py
-python warp_decode/tests/test_down_correctness.py
+python tests/test_gate_up_correctness.py
+python tests/test_down_correctness.py
+
+# With SGLang and sgl-kernel installed:
+python tests/test_benchmark_reference.py
 ```
 
-The initial import triggers an `nvcc` build under
-`warp_decode/build/`. Subsequent imports reuse the cached extension.
+The initial import triggers an `nvcc` build under `build/`. Subsequent imports
+reuse the cached extension.
 
 Set `WARP_DECODE_VERBOSE=1` to see the `nvcc` invocation on rebuild:
 
 ```bash
-WARP_DECODE_VERBOSE=1 python warp_decode/tests/test_gate_up_correctness.py
+WARP_DECODE_VERBOSE=1 python tests/test_gate_up_correctness.py
 ```
 
 ### Benchmark
 
 ```bash
-# All three modes, Qwen3-235B TP=8 defaults, batch 1..64
-python warp_decode/benchmark/bench.py
+# Reproduce the batch set and iteration count used in the tables above.
+# Run three times and take the median for each row.
+python benchmark/bench.py --mode all --batches 1,2,4,8,16,32,64 --warmup 25 --iters 200
 
 # One mode only, custom batch set
-python warp_decode/benchmark/bench.py --mode e2e --batches 1,8,16,32,64
+python benchmark/bench.py --mode e2e --batches 1,8,16,32,64
 
 # Custom shape (e.g. TP=4)
-python warp_decode/benchmark/bench.py --tp-size 4 --batches 1..32
+python benchmark/bench.py --tp-size 4 --batches 1..32
 ```
+
+The script prints the SGLang version and selected configurations. SGLang logs
+any configuration fallback. The isolated down benchmark includes routing and
+uses initialized activations for both implementations. For a down configuration
+that requires sorted TMA activations, use `--mode e2e` to run SGLang's standard
+end-to-end path.
 
 ### Python API
 

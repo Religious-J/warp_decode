@@ -6,7 +6,7 @@ Three modes (default: all):
   e2e     : gate_up + down (warp_decode)         vs  full sglang MoE pipeline
 
 Run from the repo root:
-    python warp_decode/benchmark/bench.py --batches 1,2,4,8,16,32,64
+    python benchmark/bench.py --batches 1,2,4,8,16,32,64
 """
 
 import argparse
@@ -21,11 +21,29 @@ sys.path.insert(0, str(_repo_root))
 import torch
 import triton.language as tl
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+import sglang
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
     invoke_fused_moe_kernel,
 )
-from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-from sgl_kernel import silu_and_mul
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+    try_get_optimal_moe_config,
+)
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    fused_experts,
+    moe_sum_reduce_torch_compile,
+)
+from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+    moe_align_block_size,
+)
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
+from sglang.jit_kernel.activation import silu_and_mul
+from sgl_kernel import moe_sum_reduce
 
 from warp_decode import warp_decode as wd
 
@@ -42,7 +60,7 @@ def parse_args():
     p.add_argument("--num-experts", type=int, default=128)
     p.add_argument("--topk", type=int, default=8)
     p.add_argument("--tp-size", type=int, default=8)
-    p.add_argument("--warmup", type=int, default=5)
+    p.add_argument("--warmup", type=int, default=25)
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--mode", choices=["gate_up", "down", "e2e", "all"], default="all")
     p.add_argument("--batches", type=str, default="1..64",
@@ -70,7 +88,11 @@ def make_inputs(B, hidden, inter, E_local, topk, device="cuda"):
     x = torch.randn(B, hidden, dtype=dtype, device=device)
     gate_up_w  = torch.randn(E_local, 2 * inter, hidden, dtype=dtype, device=device)
     down_w     = torch.randn(E_local, hidden, inter,    dtype=dtype, device=device)
-    topk_ids   = torch.randint(0, E_local, (B, topk), dtype=torch.int32, device=device)
+    # Real top-k routing selects distinct experts for each token.
+    if not 1 <= topk <= E_local:
+        raise ValueError("topk must be between 1 and num_experts")
+    topk_ids = torch.rand(B, E_local, device=device).topk(topk, dim=1).indices
+    topk_ids = topk_ids.to(torch.int32).contiguous()
     raw        = torch.rand(B, topk, dtype=torch.float32, device=device)
     topk_scale = raw / raw.sum(dim=1, keepdim=True)
     return x, gate_up_w, down_w, topk_ids, topk_scale
@@ -104,26 +126,33 @@ def bench_cuda_graph(fn, warmup, iters):
     return t0.elapsed_time(t1) / iters
 
 
-def sglang_bf16_config(total_m, E):
-    if total_m <= E:
-        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64,
-                    GROUP_SIZE_M=1, num_warps=4, num_stages=3)
-    return dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32,
-                GROUP_SIZE_M=8, num_warps=4, num_stages=3)
+def initialize_sglang():
+    """Use declared server defaults without loading a model or starting a server."""
+    try:
+        get_global_server_args()
+    except ValueError:
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", moe_runner_backend="triton")
+        )
 
 
-def _alloc_routing_buffers(topk_ids, E_local, bm, device):
-    if topk_ids.numel() < E_local + 1:
-        max_padded = topk_ids.numel() * bm
-    else:
-        max_padded = topk_ids.numel() + (E_local + 1) * (bm - 1)
-    max_m_blocks = (max_padded + bm - 1) // bm
-    return dict(
-        max_padded          = max_padded,
-        sorted_ids          = torch.empty(max_padded,            dtype=torch.int32, device=device),
-        expert_ids          = torch.empty(max_m_blocks,          dtype=torch.int32, device=device),
-        num_tokens_post_pad = torch.empty(1,                     dtype=torch.int32, device=device),
-        cumsum_buf          = torch.empty(E_local + 2,           dtype=torch.int32, device=device),
+def sglang_bf16_configs(B, gate_up_shape, down_shape, topk):
+    """Use SGLang's device/shape config lookup with original batch size M=B."""
+    initialize_sglang()
+    config, (down_config, _) = try_get_optimal_moe_config(
+        gate_up_shape, down_shape, topk, None, B, return_down_config=True,
+    )
+    return dict(config), dict(down_config or config)
+
+
+def _invoke_bf16(a, w, out, ids, scale, routing, config, mul_weight, topk):
+    invoke_fused_moe_kernel(
+        a, w, None, out, None, None, None, scale, ids, *routing,
+        mul_weight, topk, config,
+        compute_type=tl.bfloat16,
+        use_fp8_w8a8=False, use_int8_w8a8=False,
+        use_int8_w8a16=False, use_int4_w4a16=False,
+        per_channel_quant=False, block_shape=None, filter_expert=False,
     )
 
 
@@ -137,39 +166,33 @@ def bench_gate_up_wd(x, gate_up_w, topk_ids, warmup, iters):
     return bench_cuda_graph(fn, warmup, iters)
 
 
-def bench_gate_up_sgl(x, gate_up_w, topk_ids, topk_scale, E_local, warmup, iters):
+def make_gate_up_sgl(x, gate_up_w, topk_ids, topk_scale):
     B, hidden = x.shape
-    inter = gate_up_w.shape[1] // 2
+    E, two_inter, _ = gate_up_w.shape
+    inter = two_inter // 2
     topk = topk_ids.shape[1]
-    total = B * topk
-
-    config = sglang_bf16_config(total, E_local)
-    bm = config["BLOCK_SIZE_M"]
-    R = _alloc_routing_buffers(topk_ids, E_local, bm, x.device)
-
-    cache1 = torch.empty(R["max_padded"], 2 * inter, dtype=torch.bfloat16, device=x.device)
-    cache2 = torch.empty(R["max_padded"], inter,     dtype=torch.bfloat16, device=x.device)
+    config, _ = sglang_bf16_configs(
+        B, gate_up_w.shape, (E, hidden, inter), topk,
+    )
+    # Routing has padded indices; activation rows are logical token/slot rows.
+    cache1 = torch.empty(B * topk, 2 * inter, dtype=x.dtype, device=x.device)
+    cache2 = torch.empty(B * topk, inter, dtype=x.dtype, device=x.device)
 
     def fn():
-        sgl_moe_align_block_size(
-            topk_ids, E_local + 1, bm,
-            R["sorted_ids"], R["expert_ids"], R["num_tokens_post_pad"],
-            R["cumsum_buf"], True,
-        )
-        invoke_fused_moe_kernel(
-            x, gate_up_w, None, cache1,
-            None, None, None,
-            topk_scale, topk_ids,
-            R["sorted_ids"], R["expert_ids"], R["num_tokens_post_pad"],
-            False, topk, config,
-            compute_type=tl.bfloat16,
-            use_fp8_w8a8=False, use_int8_w8a8=False,
-            use_int8_w8a16=False, use_int4_w4a16=False,
-            per_channel_quant=False, block_shape=None,
-        )
+        routing = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
+        _invoke_bf16(x, gate_up_w, cache1, topk_ids, topk_scale,
+                     routing, config, False, topk)
         silu_and_mul(cache1, cache2)
+        return cache2
 
-    return bench_cuda_graph(fn, warmup, iters)
+    return fn
+
+
+def bench_gate_up_sgl(x, gate_up_w, topk_ids, topk_scale, E_local, warmup, iters):
+    assert E_local == gate_up_w.shape[0]
+    return bench_cuda_graph(
+        make_gate_up_sgl(x, gate_up_w, topk_ids, topk_scale), warmup, iters,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,48 +206,42 @@ def bench_down_wd(buffer, down_w, topk_ids, topk_scale, warmup, iters):
     return bench_cuda_graph(fn, warmup, iters)
 
 
-def bench_down_sgl(down_w, topk_ids, topk_scale, E_local, warmup, iters):
-    """Mirrors step 3+4 of the reference pipeline (down GEMM + topk sum-reduce).
-
-    The sglang triton down kernel indexes its A input via `sorted_ids`, so we
-    allocate `cache2` at max padded size. Values don't matter for timing.
-    """
-    B = topk_scale.shape[0]
-    hidden = down_w.shape[1]
-    inter  = down_w.shape[2]
-    topk = topk_ids.shape[1]
-    total = B * topk
-
-    config = sglang_bf16_config(total, E_local)
-    bm = config["BLOCK_SIZE_M"]
-    R = _alloc_routing_buffers(topk_ids, E_local, bm, down_w.device)
-
-    cache2 = torch.empty(R["max_padded"], inter, dtype=torch.bfloat16, device=down_w.device)
-    cache3 = torch.empty(B, topk, hidden,        dtype=torch.bfloat16, device=down_w.device)
-    out    = torch.empty(B, hidden,              dtype=torch.bfloat16, device=down_w.device)
+def make_down_sgl(buffer, down_w, topk_ids, topk_scale):
+    """Standard down config and combine kernels, with routing included in timing."""
+    B, topk = topk_ids.shape
+    E, hidden, inter = down_w.shape
+    config, down_config = sglang_bf16_configs(
+        B, (E, 2 * inter, hidden), down_w.shape, topk,
+    )
+    if down_config.get("USE_TMA", False):
+        raise NotImplementedError(
+            "Standalone down uses unsorted activations; use --mode e2e "
+            "for SGLang's sorted TMA path."
+        )
+    cache3 = torch.empty(B, topk, hidden, dtype=buffer.dtype, device=buffer.device)
+    out = torch.empty(B, hidden, dtype=buffer.dtype, device=buffer.device)
 
     def fn():
-        sgl_moe_align_block_size(
-            topk_ids, E_local + 1, bm,
-            R["sorted_ids"], R["expert_ids"], R["num_tokens_post_pad"],
-            R["cumsum_buf"], True,
-        )
-        invoke_fused_moe_kernel(
-            cache2, down_w, None, cache3,
-            None, None, None,
-            topk_scale, topk_ids,
-            R["sorted_ids"], R["expert_ids"], R["num_tokens_post_pad"],
-            True,  # mul_routed_weight
-            1,     # top_k=1: sorted rows map 1:1 into cache3[B, topk, hidden]
-            config,
-            compute_type=tl.bfloat16,
-            use_fp8_w8a8=False, use_int8_w8a8=False,
-            use_int8_w8a16=False, use_int4_w4a16=False,
-            per_channel_quant=False, block_shape=None,
-        )
-        torch.sum(cache3, dim=1, out=out)
+        routing = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
+        _invoke_bf16(buffer, down_w, out.unsqueeze(0) if topk == 1 else cache3,
+                     topk_ids, topk_scale, routing, down_config, True, 1)
+        if topk == 2:
+            torch.add(cache3[:, 0], cache3[:, 1], out=out)
+        elif topk > 2:
+            if B <= 32:
+                moe_sum_reduce_torch_compile(cache3, out, 1.0)
+            else:
+                moe_sum_reduce(cache3, out, 1.0)
+        return out
 
-    return bench_cuda_graph(fn, warmup, iters)
+    return fn
+
+
+def bench_down_sgl(buffer, down_w, topk_ids, topk_scale, E_local, warmup, iters):
+    assert E_local == down_w.shape[0]
+    return bench_cuda_graph(
+        make_down_sgl(buffer, down_w, topk_ids, topk_scale), warmup, iters,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -239,53 +256,27 @@ def bench_e2e_wd(x, gate_up_w, down_w, topk_ids, topk_scale, warmup, iters):
     return bench_cuda_graph(fn, warmup, iters)
 
 
-def bench_e2e_sgl(x, gate_up_w, down_w, topk_ids, topk_scale, E_local, warmup, iters):
-    B, hidden = x.shape
-    inter = gate_up_w.shape[1] // 2
-    topk = topk_ids.shape[1]
-    total = B * topk
-
-    config = sglang_bf16_config(total, E_local)
-    bm = config["BLOCK_SIZE_M"]
-    R = _alloc_routing_buffers(topk_ids, E_local, bm, x.device)
-
-    cache1 = torch.empty(R["max_padded"], 2 * inter, dtype=torch.bfloat16, device=x.device)
-    cache2 = torch.empty(R["max_padded"], inter,     dtype=torch.bfloat16, device=x.device)
-    cache3 = torch.empty(B, topk, hidden,            dtype=torch.bfloat16, device=x.device)
-    out    = torch.empty(B, hidden,                  dtype=torch.bfloat16, device=x.device)
+def make_e2e_sgl(x, gate_up_w, down_w, topk_ids, topk_scale):
+    """Call the standard SGLang Triton FFN, including routing and combine."""
+    initialize_sglang()
+    E = gate_up_w.shape[0]
+    runner_config = MoeRunnerConfig(
+        num_experts=E, num_local_experts=E,
+        top_k=topk_ids.shape[1], inplace=False,
+    )
+    topk_output = StandardTopKOutput(topk_scale, topk_ids, None)
 
     def fn():
-        sgl_moe_align_block_size(
-            topk_ids, E_local + 1, bm,
-            R["sorted_ids"], R["expert_ids"], R["num_tokens_post_pad"],
-            R["cumsum_buf"], True,
-        )
-        invoke_fused_moe_kernel(
-            x, gate_up_w, None, cache1,
-            None, None, None,
-            topk_scale, topk_ids,
-            R["sorted_ids"], R["expert_ids"], R["num_tokens_post_pad"],
-            False, topk, config,
-            compute_type=tl.bfloat16,
-            use_fp8_w8a8=False, use_int8_w8a8=False,
-            use_int8_w8a16=False, use_int4_w4a16=False,
-            per_channel_quant=False, block_shape=None,
-        )
-        silu_and_mul(cache1, cache2)
-        invoke_fused_moe_kernel(
-            cache2, down_w, None, cache3,
-            None, None, None,
-            topk_scale, topk_ids,
-            R["sorted_ids"], R["expert_ids"], R["num_tokens_post_pad"],
-            True, 1, config,
-            compute_type=tl.bfloat16,
-            use_fp8_w8a8=False, use_int8_w8a8=False,
-            use_int8_w8a16=False, use_int4_w4a16=False,
-            per_channel_quant=False, block_shape=None,
-        )
-        torch.sum(cache3, dim=1, out=out)
+        return fused_experts(x, gate_up_w, down_w, topk_output, runner_config)
 
-    return bench_cuda_graph(fn, warmup, iters)
+    return fn
+
+
+def bench_e2e_sgl(x, gate_up_w, down_w, topk_ids, topk_scale, E_local, warmup, iters):
+    assert E_local == gate_up_w.shape[0]
+    return bench_cuda_graph(
+        make_e2e_sgl(x, gate_up_w, down_w, topk_ids, topk_scale), warmup, iters,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,19 +304,29 @@ def run_mode(name, B_list, args, hidden, inter, E_local, topk, wd_call, sgl_call
 def main():
     args = parse_args()
     hidden = args.hidden_size
+    if args.tp_size <= 0 or args.intermediate_size % args.tp_size:
+        raise ValueError("intermediate-size must be divisible by a positive tp-size")
     inter  = args.intermediate_size // args.tp_size
     E_local = args.num_experts     # matches sglang bench: TP shards only inter
     topk = args.topk
     B_list = parse_batches(args.batches)
 
+    initialize_sglang()
     torch.manual_seed(0)
 
     dev = torch.cuda.get_device_properties(0)
 
     print(f"\ndevice        : {dev.name}")
+    print(f"reference     : SGLang {sglang.__version__} standard Triton path")
     print(f"config        : hidden={hidden} inter={inter} E_local={E_local} topk={topk}")
     print(f"weights       : gate_up={E_local*2*inter*hidden*2/1e6:.1f} MB, "
           f"down={E_local*hidden*inter*2/1e6:.1f} MB")
+
+    for B in B_list:
+        up_config, down_config = sglang_bf16_configs(
+            B, (E_local, 2 * inter, hidden), (E_local, hidden, inter), topk,
+        )
+        print(f"sglang config : B={B} gate_up={up_config} down={down_config}")
 
     modes = ["gate_up", "down", "e2e"] if args.mode == "all" else [args.mode]
 
@@ -340,7 +341,8 @@ def main():
         return bench_down_wd(buf, dn, ids, sc, w, i)
 
     def _sgl_dn(x, gu, dn, ids, sc, w, i):
-        return bench_down_sgl(dn, ids, sc, E_local, w, i)
+        buf = wd.moe_gate_up_3d_batched(x, gu, ids)
+        return bench_down_sgl(buf, dn, ids, sc, E_local, w, i)
 
     def _wd_e2e (x, gu, dn, ids, sc, w, i): return bench_e2e_wd (x, gu, dn, ids, sc,           w, i)
     def _sgl_e2e(x, gu, dn, ids, sc, w, i): return bench_e2e_sgl(x, gu, dn, ids, sc, E_local, w, i)
