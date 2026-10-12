@@ -8,9 +8,9 @@
 //   ids     : [B, topk]                    int32
 //   out     : [B * topk, inter]            bf16 (silu(gate) * up, fused)
 //
-// Parallelism (warp-per-neuron):
-//   gridDim.x = B * topk; gridDim.y = inter / WARPS_PER_CTA.
-//   Each warp streams one gate/up weight row and reads X through the cache.
+// Parallelism (two neurons per warp):
+//   gridDim.x = B * topk; gridDim.y = inter / (WARPS_PER_CTA * OUTS_PER_WARP).
+//   Each warp reuses one decoded input vector across two gate/up weight rows.
 //   FP8 pairs are widened before FP32 accumulation; each vector stays within
 //   one 128-element scale group. Gate/up rounds to BF16 before activation.
 
@@ -31,6 +31,10 @@ constexpr int SCALE_GROUP     = 128;
 constexpr int WARPS_PER_CTA   = 4;
 constexpr int THREADS_PER_CTA = WARPS_PER_CTA * 32;
 constexpr int VEC             = 16;  // 16 FP8 values == 16 B == uint4
+constexpr int OUTS_PER_WARP   = 2;
+
+static_assert(SCALE_GROUP % OUTS_PER_WARP == 0);
+static_assert(INTER_SIZE % (WARPS_PER_CTA * OUTS_PER_WARP) == 0);
 
 using fp8 = __nv_fp8_e4m3;
 
@@ -103,12 +107,15 @@ __global__ void moe_gate_up_3d_batched_kernel(
     const int token_id = flat_tok / TOPK;
     const int warp_id  = threadIdx.x >> 5;
     const int lane_id  = threadIdx.x & 31;
-    const int neuron_n = blockIdx.y * WARPS_PER_CTA + warp_id;
+    const int neuron_n = (blockIdx.y * WARPS_PER_CTA + warp_id) * OUTS_PER_WARP;
     const int expert_id = topk_ids[flat_tok];
 
     if (expert_id < 0 || expert_id >= NUM_EXPERTS) {
         if (lane_id == 0) {
-            out[(size_t)flat_tok * INTER_SIZE + neuron_n] = __float2bfloat16_rn(nanf(""));
+            #pragma unroll
+            for (int j = 0; j < OUTS_PER_WARP; ++j) {
+                out[(size_t)flat_tok * INTER_SIZE + neuron_n + j] = __float2bfloat16_rn(nanf(""));
+            }
         }
         return;
     }
@@ -122,46 +129,58 @@ __global__ void moe_gate_up_3d_batched_kernel(
         (HIDDEN_SIZE / SCALE_GROUP);
     const float* up_scale = gate_scale + (INTER_SIZE / SCALE_GROUP) * (HIDDEN_SIZE / SCALE_GROUP);
 
-    float acc_gate = 0.f;
-    float acc_up   = 0.f;
+    float acc_gate[OUTS_PER_WARP]{};
+    float acc_up[OUTS_PER_WARP]{};
 
     #pragma unroll
     for (int k = lane_id * VEC; k < HIDDEN_SIZE; k += 32 * VEC) {
         uint4 xv = *reinterpret_cast<const uint4*>(&x_ptr[k]);
-        uint4 gv = *reinterpret_cast<const uint4*>(&gate_ptr[k]);
-        uint4 uv = *reinterpret_cast<const uint4*>(&up_ptr[k]);
-
         const auto* x_pairs = reinterpret_cast<const uint16_t*>(&xv);
-        const auto* g_pairs = reinterpret_cast<const uint16_t*>(&gv);
-        const auto* u_pairs = reinterpret_cast<const uint16_t*>(&uv);
-        float local_gate = 0.f;
-        float local_up   = 0.f;
+        float2 xf[VEC / 2];
+        #pragma unroll
+        for (int i = 0; i < VEC / 2; ++i) xf[i] = unpack_fp8_pair(x_pairs[i]);
+        const float scale = x_scale[(size_t)token_id * (HIDDEN_SIZE / SCALE_GROUP) + k / SCALE_GROUP];
+        const float gate_factor = scale * gate_scale[k / SCALE_GROUP];
+        const float up_factor   = scale * up_scale[k / SCALE_GROUP];
 
         #pragma unroll
-        for (int i = 0; i < VEC / 2; ++i) {
-            const float2 xf = unpack_fp8_pair(x_pairs[i]);
-            const float2 gf = unpack_fp8_pair(g_pairs[i]);
-            const float2 uf = unpack_fp8_pair(u_pairs[i]);
-            local_gate = fmaf(xf.x, gf.x, local_gate);
-            local_gate = fmaf(xf.y, gf.y, local_gate);
-            local_up   = fmaf(xf.x, uf.x, local_up);
-            local_up   = fmaf(xf.y, uf.y, local_up);
-        }
+        for (int j = 0; j < OUTS_PER_WARP; ++j) {
+            uint4 gv = *reinterpret_cast<const uint4*>(&gate_ptr[j * HIDDEN_SIZE + k]);
+            uint4 uv = *reinterpret_cast<const uint4*>(&up_ptr[j * HIDDEN_SIZE + k]);
+            const auto* g_pairs = reinterpret_cast<const uint16_t*>(&gv);
+            const auto* u_pairs = reinterpret_cast<const uint16_t*>(&uv);
+            float local_gate = 0.f;
+            float local_up   = 0.f;
 
-        const float scale = x_scale[(size_t)token_id * (HIDDEN_SIZE / SCALE_GROUP) + k / SCALE_GROUP];
-        acc_gate = fmaf(local_gate, scale * gate_scale[k / SCALE_GROUP], acc_gate);
-        acc_up   = fmaf(local_up,   scale * up_scale[k / SCALE_GROUP],   acc_up);
+            #pragma unroll
+            for (int i = 0; i < VEC / 2; ++i) {
+                const float2 gf = unpack_fp8_pair(g_pairs[i]);
+                const float2 uf = unpack_fp8_pair(u_pairs[i]);
+                local_gate = fmaf(xf[i].x, gf.x, local_gate);
+                local_gate = fmaf(xf[i].y, gf.y, local_gate);
+                local_up   = fmaf(xf[i].x, uf.x, local_up);
+                local_up   = fmaf(xf[i].y, uf.y, local_up);
+            }
+            acc_gate[j] = fmaf(local_gate, gate_factor, acc_gate[j]);
+            acc_up[j]   = fmaf(local_up,   up_factor,   acc_up[j]);
+        }
     }
 
-    acc_gate = warp_reduce_sum(acc_gate);
-    acc_up   = warp_reduce_sum(acc_up);
+    #pragma unroll
+    for (int j = 0; j < OUTS_PER_WARP; ++j) {
+        acc_gate[j] = warp_reduce_sum(acc_gate[j]);
+        acc_up[j]   = warp_reduce_sum(acc_up[j]);
+    }
 
     if (lane_id == 0) {
-        // Match the BF16 GEMM boundary before SGLang's SiLU-and-multiply.
-        acc_gate = __bfloat162float(__float2bfloat16_rn(acc_gate));
-        acc_up   = __bfloat162float(__float2bfloat16_rn(acc_up));
-        const float y = silu_f32(acc_gate) * acc_up;
-        out[(size_t)flat_tok * INTER_SIZE + neuron_n] = __float2bfloat16_rn(y);
+        #pragma unroll
+        for (int j = 0; j < OUTS_PER_WARP; ++j) {
+            // Match the BF16 GEMM boundary before SGLang's SiLU-and-multiply.
+            const float gate = __bfloat162float(__float2bfloat16_rn(acc_gate[j]));
+            const float up   = __bfloat162float(__float2bfloat16_rn(acc_up[j]));
+            const float y = silu_f32(gate) * up;
+            out[(size_t)flat_tok * INTER_SIZE + neuron_n + j] = __float2bfloat16_rn(y);
+        }
     }
 }
 
@@ -194,7 +213,7 @@ void launch_moe_gate_up_3d_batched(
     cudaStream_t stream)
 {
     if (!B) return;
-    dim3 grid(B * TOPK, INTER_SIZE / WARPS_PER_CTA);
+    dim3 grid(B * TOPK, INTER_SIZE / (WARPS_PER_CTA * OUTS_PER_WARP));
     dim3 block(THREADS_PER_CTA);
     moe_gate_up_3d_batched_kernel<<<grid, block, 0, stream>>>(
         static_cast<const fp8*>(X), static_cast<const fp8*>(W), x_scale, w_scale,
