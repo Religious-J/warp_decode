@@ -13,7 +13,7 @@
 //   buffer[token, :, :] fits in L1/L2 (3 KB @ Qwen3-TP8), so no smem staging.
 //
 //   1D grid over (token, output group). For inter=192, B=1..2 uses
-//   2 outputs/warp and 4 warps/CTA; B=3..15 uses 8 outputs/warp and 2 warps/CTA.
+//   2 outputs/warp and 4 warps/CTA; B=3..16 uses 8 outputs/warp and 2 warps/CTA.
 //   The generic path uses 8 outputs/warp and 8 warps/CTA.
 //
 // Constraints:
@@ -170,7 +170,7 @@ void launch_moe_down_3d_batched(
     cudaStream_t stream)
 {
     const size_t total_warps = (size_t)B * (hidden / OUTS_PER_WARP);
-    if (B > 0 && B < 16 && inter == 192) {
+    if (B > 0 && B <= 16 && inter == 192) {
         if (B <= 2) {
             constexpr int SMALL_BATCH_OUTS = 2;
             constexpr int SMALL_BATCH_WARPS = 4;
