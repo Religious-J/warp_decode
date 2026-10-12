@@ -1,7 +1,7 @@
 # warp_decode
 
 An **unofficial re-implementation** of Cursor's *warp decode* MoE inference
-technique ([blog](https://cursor.com/blog/warp-decode)), targeting **BF16
+technique ([blog](https://cursor.com/blog/warp-decode)), targeting **blockwise FP8 W8A8
 precision on NVIDIA Hopper GPUs (H20 / H100)**.
 
 Cursor's original work targets Blackwell and MXFP8; the public blog describes
@@ -9,10 +9,9 @@ the high-level idea (organize the kernel around outputs instead of experts,
 give each warp one output neuron, avoid all staging) but not the concrete
 kernel shape. This repository is an independent implementation that arrives at
 similar conclusions on Hopper by working the design out from a roofline
-argument, and adds a few Hopper-specific optimizations that were needed to
-actually turn the idea into a measured win.
+argument. This version targets Qwen3.6-35B-A3B at TP=1.
 
-The two kernels in this repository are:
+The two MoE kernels in this repository are:
 
 | Kernel                          | Fused operation                                                                 |
 | ------------------------------- | ------------------------------------------------------------------------------- |
@@ -31,86 +30,30 @@ scatter / permute is needed**. Router scoring and top-k selection are excluded.
 - **GPU:** NVIDIA H20 (Hopper, sm_90), with dynamic clocks.
 - **Software:** PyTorch 2.13.0+cu130, CUDA toolkit 13.0.88, Triton 3.7.1,
   SGLang 0.5.21, sglang-kernel 0.4.7.
-- **Shape:** Qwen3-235B-A22B-style MoE FFN under TP=8:
-  `hidden=4096`, `inter=192` (1536 before TP split), `num_experts=128`, `topk=8`.
-- **Reference:** SGLang's standard Triton configuration lookup and
-  `fused_experts` end-to-end path. Configurations are selected using the original
-  batch size `M=B`; gate/up and down use their respective standard configurations.
+- **Shape:** Qwen3.6-35B-A3B MoE FFN under TP=1:
+  `hidden=2048`, `inter=512`, `num_experts=256`, `topk=8`.
+- **Reference:** SGLang's standard Triton FP8 configuration lookup and
+  `fused_experts` end-to-end path.
 - **Routing:** eight distinct experts per token, with normalized FP32 routing weights.
 - **Timing:** CUDA Events over 16 calls per graph and 200 graph replays per sample.
-  Latencies are medians of 14 samples from two runs. Weights and routing are fixed;
-  repeated replay can benefit from caching.
-- **Precision:** BF16 activations and weights, FP32 accumulators.
-
-For this environment, SGLang falls back to its bundled Triton 3.2.0 H20
-configuration. There is no dedicated down configuration for this shape, so
-SGLang uses its standard gate/up configuration fallback.
+  Weights and routing are fixed; repeated replay can benefit from caching.
+- **Precision:** E4M3 activations and weights, FP32 accumulators. Activations
+  use one scale per row and 128 elements; weights use one scale per 128×128 block.
 
 ### Results
 
-Times are per call in milliseconds. `speedup = sglang_ms / warp_decode_ms`.
-SGLang stage timings include expert alignment.
-Speedups above 1 favor warp_decode; `tokens = batch × topk`. Both implementations receive
-precomputed top-k IDs and weights, so router computation is excluded. The
-end-to-end benchmark measures gate/up, activation, down, and expert combination
-in one call. Stage timings are measured separately and should not be added to
-estimate end-to-end latency.
-
-**Gate/up + SiLU activation:**
-
-| batch | tokens | warp_decode (ms) | SGLang Triton (ms) | speedup |
-| ----: | -----: | ---------------: | -----------------: | ------: |
-| 1 | 8 | 0.0059 | 0.0169 | 2.84x |
-| 2 | 16 | 0.0121 | 0.0277 | 2.28x |
-| 4 | 32 | 0.0315 | 0.0369 | 1.17x |
-| 8 | 64 | 0.0504 | 0.0573 | 1.14x |
-| 16 | 128 | 0.0933 | 0.0896 | 0.96x |
-| 32 | 256 | 0.1551 | 0.1198 | 0.77x |
-| 64 | 512 | 0.2829 | 0.1258 | 0.44x |
-
-**Down + top-k weighted sum (with alignment):**
-
-| batch | tokens | warp_decode (ms) | SGLang Triton (ms) | speedup |
-| ----: | -----: | ---------------: | -----------------: | ------: |
-| 1 | 8 | 0.0050 | 0.0097 | 1.94x |
-| 2 | 16 | 0.0079 | 0.0165 | 2.08x |
-| 4 | 32 | 0.0151 | 0.0210 | 1.39x |
-| 8 | 64 | 0.0334 | 0.0373 | 1.12x |
-| 16 | 128 | 0.0680 | 0.0555 | 0.82x |
-| 32 | 256 | 0.1372 | 0.0711 | 0.52x |
-| 64 | 512 | 0.2689 | 0.0767 | 0.29x |
-
-**End-to-end MoE FFN:**
-
-| batch | tokens | warp_decode (ms) | SGLang Triton (ms) | speedup |
-| ----: | -----: | ---------------: | -----------------: | ------: |
-| 1 | 8 | 0.0136 | 0.0259 | 1.90x |
-| 2 | 16 | 0.0267 | 0.0436 | 1.63x |
-| 4 | 32 | 0.0501 | 0.0580 | 1.16x |
-| 8 | 64 | 0.0848 | 0.0903 | 1.06x |
-| 16 | 128 | 0.1630 | 0.1441 | 0.88x |
-| 32 | 256 | 0.2945 | 0.1870 | 0.63x |
-| 64 | 512 | 0.5516 | 0.2037 | 0.37x |
-
-### Interpretation
-
-For this shape on H20, warp_decode is faster at small batch sizes: the
-end-to-end speedup is 1.90x at batch 1 and 1.06x at batch 8. The standard
-SGLang reference is faster at batches 16, 32, and 64.
-
-These measurements support using warp_decode for small-batch decode. The
-crossover depends on the shape, routing distribution, GPU, and SGLang
-configuration; it should be measured for the intended workload.
+The current FP8 implementation needs a complete benchmark run before recording
+new performance tables. The benchmark measures dynamic activation quantization,
+gate/up, SiLU, down, and expert combination in one call. Both implementations
+receive precomputed top-k IDs and weights, so router computation is excluded.
 
 ---
 
 ## Design & optimizations
 
 The blog gives one useful headline — *"assign each warp to one output value,
-stream weights, avoid staging"* — but leaves out the details that actually
-determine performance on Hopper. Direct translation of the headline gives a
-kernel that is correct but far from optimal (we measured this — see below).
-Two structural changes were needed for each of the two kernels.
+stream weights, avoid staging"*. Both kernels retain this output-oriented layout
+and apply FP8 block scales within the dot-product loop.
 
 ### `moe_gate_up_3d_batched`
 
@@ -118,21 +61,24 @@ Two structural changes were needed for each of the two kernels.
 where the output is `silu(gate) * up` fused.
 
 **Kernel structure:**
-- 2D grid: `(B*topk, inter / WARPS_PER_CTA)`, `blockDim = 256` = 8 warps
+
+- 2D grid: `(B*topk, inter / WARPS_PER_CTA)`, `blockDim = 128` = 4 warps.
 - Each CTA handles one `(token, topk_slot)` pair.
-- The 8 warps in a CTA together cover 8 adjacent output neurons.
-- All 8 warps in a CTA read the **same** `x[token]` row directly from
+- The 4 warps in a CTA together cover 4 adjacent output neurons.
+- All 4 warps in a CTA read the **same** `x[token]` row directly from
   global memory through the cache hierarchy, without shared-memory staging.
 - Each warp streams two weight rows (`gate` and `up` for its neuron) directly
-  from HBM using vectorized `uint4` loads (`VEC = 8` bf16 per lane per iter),
+  from HBM using vectorized `uint4` loads (`VEC = 16` FP8 per lane per iter),
   and accumulates the two dot products in registers.
-- Final `silu(g) * u` and the bf16 write-out happen at the end in a single
-  lane.
+- Each vector stays within one 128-element scale group. FP8 pairs are widened
+  to FP32, accumulated, and multiplied by the activation and weight scales.
+- Gate/up results round to BF16 before FP32 `silu(g) * u`; the final BF16
+  write-out happens at the end in a single lane.
 
 **Why this specific layout:**
-- The reduction axis is `hidden = 4096`, long enough that a single warp gives
-  a sufficiently deep dot-product pipeline.
-- 8 warps per CTA provide warp-level parallelism to hide weight-loading latency.
+
+- The reduction axis is `hidden = 2048`, giving four vector-load iterations.
+- 4 warps per CTA provide warp-level parallelism to hide weight-loading latency.
 - Each warp performs its own reduction, without a CTA barrier.
 
 ### `moe_down_3d_batched`
@@ -140,58 +86,30 @@ where the output is `silu(gate) * up` fused.
 **Shape.** `buffer:[B, topk, inter]` × `W:[E, hidden, inter]` → `[B, hidden]`,
 with per-slot `topk_scale` folded in and a sum-reduce over `topk`.
 
-**This kernel is where the naive translation of Cursor's headline hurts.**
-The obvious mirror of the gate_up design — 1 warp per output `h`, stage
-`buffer[token, :, :]` in shared memory, sum across topk in a single warp —
-was significantly slower than the sglang triton reference for `B > 4` in
-earlier measurements. The reasons are structural:
+**Kernel structure:**
 
-1. The reduction axis is `inter = 192`, only ~3 lane-loop iterations. A
-   single dot product is not enough to hide HBM latency by itself.
-2. The small input buffer is reused through the cache hierarchy. Staging it
-   in smem adds `__syncthreads` and extra staging work.
-
-The design that actually works on Hopper is very different:
-
-**Kernel structure (v2):**
-- **1D grid** over `(token, h-group)`. Each warp owns adjacent output dims:
-  2 for `inter=192, B=1–2`, and 8 otherwise.
-- No shared memory at all. The 3 KB per-token buffer fits comfortably in the
-  L1/L2 hierarchy on its own; explicit staging just costs.
-- For each of the `topk` experts, the warp reads one `bf16x2` element of the
-  buffer and reuses it across its output weight rows. BF16 operands are widened
-  before FP32 `fmaf` updates, without rounding the products to BF16.
+- **1D grid** over `(token, h-group)`. Each warp owns 4 adjacent output dims.
+- No shared-memory staging. The input buffer is reused through the cache hierarchy.
+- For each of the `topk` experts, the warp reads 4 FP8 buffer elements per lane
+  and reuses them across its output weight rows.
+- FP8 operands are widened before FP32 multiplication and accumulation;
+  activation and weight block scales are applied within the reduction.
 - Independent FP32 accumulators (one per output `h`) live in registers per
   lane; the topk-weighted sum folds `topk_scale` in FP32 before the final
   BF16 conversion.
-- The output loop is `#pragma unroll`-ed. The `inter=192, B < 16` path
-  also fully unrolls the reduction.
-
-**Development measurements** (Qwen3 TP=8, batch 16):
-
-| version | down time |
-| ------- | --------: |
-| v1: 1 warp / output, smem-staged buffer | 0.143 ms |
-| v2: `OUTS_PER_WARP = 2`, no smem | 0.097 ms |
-| v2: `OUTS_PER_WARP = 8`, fully unrolled | 0.066 ms |
-
-These earlier measurements illustrate the effect of the kernel design changes.
-The performance tables above use the current standard SGLang reference.
-
-The earlier `OUTS_PER_WARP` sweep on H20 favored 8: 4 leaves
-input-side arithmetic intensity on the table, 16 pushes register pressure
-past the point where occupancy falls off and the B=1 CTA count halves.
+- The output and reduction loops are `#pragma unroll`-ed.
 
 ### Numerical accuracy
 
-Both kernels use BF16 activations and weights with FP32 accumulators. The
-gate/up kernel converts operands to FP32 before multiplication and applies
-SiLU in FP32 before writing BF16 output. The down kernel also widens operands
-before FP32 multiplication and accumulation. It applies `topk_scale` and sums
-across experts in FP32 before the final BF16 conversion.
+Both kernels use E4M3 activations and weights with FP32 accumulators.
+Dequantization is `value = fp8_value * scale`. BF16 inputs are dynamically
+quantized per row and 128 elements, with `scale = max(abs(group), 1e-10) / 448`.
+The BF16 SiLU output is requantized to FP8 before the down projection.
+The down kernel applies `topk_scale` and sums across experts in FP32 before
+one final BF16 conversion.
 
-The measured batches passed independent FP32-reference and CUDA Graph checks.
-Maximum warp_decode NRMSE was 0.1679% for down and 0.1694% for the complete FFN.
+The implementation passed independent FP32-reference, SGLang-reference,
+CUDA Graph, and CUDA memory-check tests.
 
 Both kernels support PyTorch's current CUDA stream and CUDA Graph capture;
 warp_decode does not currently use Programmatic Dependent Launch (PDL).
@@ -203,7 +121,7 @@ warp_decode does not currently use Programmatic Dependent Launch (PDL).
 ### Requirements
 
 - Linux, a CUDA toolkit compatible with the installed PyTorch build, and a
-  Hopper GPU (sm_90). The benchmark above was tested on H20 with CUDA 13.0.
+  Hopper GPU (sm_90). The kernels were tested on H20 with CUDA 13.0.
 - PyTorch (with matching CUDA build) — the kernels are JIT-compiled via
   `torch.utils.cpp_extension.load`, no separate build step is needed.
 - For benchmarks: `sglang` and `sglang-kernel`.
@@ -212,8 +130,7 @@ warp_decode does not currently use Programmatic Dependent Launch (PDL).
 
 ```bash
 # From the repo root — the kernels are JIT-compiled on the first import.
-python tests/test_gate_up_correctness.py
-python tests/test_down_correctness.py
+python tests/test_fp8_blockwise.py
 
 # With SGLang and sglang-kernel installed:
 python tests/test_benchmark_reference.py
@@ -225,27 +142,21 @@ reuse the cached extension.
 Set `WARP_DECODE_VERBOSE=1` to see the `nvcc` invocation on rebuild:
 
 ```bash
-WARP_DECODE_VERBOSE=1 python tests/test_gate_up_correctness.py
+WARP_DECODE_VERBOSE=1 python tests/test_fp8_blockwise.py
 ```
 
 ### Benchmark
 
 ```bash
-# Quick comparison (one call per CUDA Graph).
-python benchmark/bench.py --mode all --batches 1,2,4,8,16,32,64 --warmup 25 --iters 200
+python benchmark/bench.py --batches 1,2,4,8,16,32,64 --iters 200
 
-# One mode only, custom batch set
-python benchmark/bench.py --mode e2e --batches 1,8,16,32,64
-
-# Custom shape (e.g. TP=4)
-python benchmark/bench.py --tp-size 4 --batches 1..32
+# Custom batch set
+python benchmark/bench.py --batches 1,8,16
 ```
 
-The script prints the SGLang version and selected configurations. SGLang logs
-any configuration fallback. The isolated down benchmark includes routing and
-uses initialized activations for both implementations. For a down configuration
-that requires sorted TMA activations, use `--mode e2e` to run SGLang's standard
-end-to-end path.
+The script prints the SGLang version and records selected configurations in
+the output JSON. SGLang logs any configuration fallback. Both implementations
+use existing FP8 weights and their FP32 block scales directly.
 
 ### Python API
 
@@ -255,28 +166,42 @@ from warp_decode import warp_decode as wd
 # gate_up + silu_and_mul (fused)
 buf = wd.moe_gate_up_3d_batched(
     x,               # [B, hidden]         bf16
-    gate_up_w,       # [E, 2*inter, hidden] bf16
+    gate_up_w,       # [E, 2*inter, hidden] fp8 E4M3
+    gate_up_scale,   # [E, 2*inter/128, hidden/128] fp32
     topk_ids,        # [B, topk]           int32
 )                    # -> [B*topk, inter]  bf16
 
 # down + topk-weighted sum-reduce (fused)
 out = wd.moe_down_3d_batched(
     buf,             # [B*topk, inter]     bf16
-    down_w,          # [E, hidden, inter]  bf16
+    down_w,          # [E, hidden, inter]  fp8 E4M3
+    down_scale,      # [E, hidden/128, inter/128] fp32
     topk_ids,        # [B, topk]           int32
     topk_scale,      # [B, topk]           fp32
-    B,               # int
 )                    # -> [B, hidden]      bf16
+
+# Complete FFN, including both activation quantization steps
+out = wd.moe_ffn_3d_batched(
+    x, gate_up_w, down_w, gate_up_scale, down_scale, topk_ids, topk_scale,
+)
 ```
+
+Prequantized E4M3 activations are also accepted with their matching FP32
+scale as the last argument (`x_scale` for gate/up and FFN, `buffer_scale` for down). `quantize_fp8_blockwise(x)` returns FP8 values
+and scales for a BF16 input. Weights and their scales are supplied directly.
 
 ### Shape constraints
 
 | kernel   | constraint                                                     |
 | -------- | -------------------------------------------------------------- |
-| gate_up  | `hidden % 256 == 0` (32 lanes × VEC=8), `inter % 8 == 0`       |
-| down     | `inter % 64 == 0` (32 lanes × VEC=2), `hidden % 8 == 0`        |
+| gate_up  | `hidden = 2048`, `inter = 512`, `num_experts = 256`, `topk = 8` |
+| down     | `hidden = 2048`, `inter = 512`, `num_experts = 256`, `topk = 8` |
 
-Both kernels assume the standard weight layouts used by sglang's fused_moe.
+Both kernels assume the standard blockwise FP8 weight layouts used by
+sglang's fused_moe: E4M3 weights `[E,N,K]`, FP32 scales `[E,N/128,K/128]`.
+All tensors must be contiguous and on the same CUDA device. FP8 data pointers
+must be 16-byte aligned; BF16 quantizer inputs need 8-byte alignment. Scales
+must be finite and positive; routing IDs must lie in `[0,256)`.
 
 ---
 
@@ -285,32 +210,16 @@ Both kernels assume the standard weight layouts used by sglang's fused_moe.
 **Consumer GPUs with multi-precision support (sm_120 and similar).**
 Local / on-device deployment is exactly the setting where small-batch,
 latency-bound decode kernels are most valuable — batch sizes are often 1–4,
-and every millisecond of TTFT/ITL is user-visible. Extending warp_decode to
-GeForce-class Blackwell (sm_120) with the full precision matrix (BF16, FP16,
-FP8, MXFP8, INT8, INT4) would let a single-GPU workstation run frontier MoEs
-at interactive latency. Concrete next steps:
-- On-the-fly dequant inside the warp loop — the parallelism layout does not
-  change, only the innermost read+convert.
-- Group / per-channel / MX scale handling that stays in registers to avoid
-  extra smem traffic.
+and every millisecond of TTFT/ITL is user-visible. Concrete next steps:
+
+- Extend to more MoE shapes and quantization layouts.
 - Autotune the same shape knobs (`WARPS_PER_CTA`, `OUTS_PER_WARP`) for
   smaller SM counts and different L2/HBM ratios.
 
 **Same idea on non-NVIDIA accelerators.**
-The roofline argument that motivates warp_decode is architecture-agnostic:
-for `B * topk / E_local < ridge_point`, any expert-centric grouped GEMM is
-wasting work, and an output-centric kernel that avoids all routing/staging
-should win. Ports worth trying:
-- **AMD (CDNA3 / RDNA):** HIP is close enough to CUDA that the two kernels
-  should translate almost mechanically; the CDNA3 memory hierarchy has a
-  lower ridge point, which extends the useful batch range further.
-- **Ascend NPU (Cube / Vector cores):** the equivalent of the "one warp per
-  output" mapping is one Vector core per output group, feeding the Cube
-  core with weight tiles. The same structural argument — skip routing,
-  fold the topk-weighted sum inside the compute unit — should transfer.
-- **Other tile-based accelerators (Trainium, TPU, etc.):** any device where
-  small-batch decode is memory-bound is a candidate.
-
+The roofline argument that motivates warp_decode is architecture-agnostic.
+The output-oriented layout could also be explored on AMD, Ascend, and other
+accelerators for small-batch decode.
 
 ---
 

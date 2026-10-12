@@ -1,82 +1,51 @@
-"""Check the benchmark's staged BF16 reference against standard SGLang Triton."""
-
-import sys
+"""Validate the benchmark's real SGLang FP8 FFN, including graph replay."""
 from pathlib import Path
-
+import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import torch
-
+from warp_decode import warp_decode as wd
 from warp_decode.benchmark.bench import (
-    initialize_sglang,
-    make_inputs,
-    make_gate_up_sgl,
-    make_down_sgl,
-    make_e2e_sgl,
+    initialize_sglang, MoeRunnerConfig, StandardTopKOutput, fused_experts,
+    sglang_per_token_group_quant_fp8,
 )
+from fp8_reference import make_weights, make_inputs, gate_reference, down_reference, ffn_reference, metrics
+from test_fp8_blockwise import graph_test
 
 
-def run_case(B, E, topk, hidden, inter):
-    torch.manual_seed(B + topk)
-    x, gu, dn, ids, scale = make_inputs(B, hidden, inter, E, topk)
-    x.mul_(0.1)
-    gu.mul_(0.05)
-    dn.mul_(0.05)
-    assert all(len(set(row)) == topk for row in ids.tolist())
-
-    gate_up = make_gate_up_sgl(x, gu, ids, scale)
-    buffer = gate_up()
-    down = make_down_sgl(buffer, dn, ids, scale)
-    staged = down()
-    e2e = make_e2e_sgl(x, gu, dn, ids, scale)
-    standard = e2e()
-    torch.testing.assert_close(staged, standard, atol=0, rtol=0)
-
-    # Independent FP32 reference, retaining the BF16 FFN activation boundary.
-    selected_gu = gu[ids.flatten().long()].float()
-    selected_x = x[:, None, :].expand(-1, topk, -1).reshape(-1, hidden).float()
-    projections = torch.bmm(selected_gu, selected_x.unsqueeze(-1)).squeeze(-1)
-    gate, up = projections.chunk(2, dim=-1)
-    ref_buffer = (torch.nn.functional.silu(gate) * up).bfloat16()
-    projected = torch.bmm(dn[ids.flatten().long()].float(),
-                          ref_buffer.float().unsqueeze(-1)).squeeze(-1)
-    ref = (projected.view(B, topk, hidden) * scale[:, :, None]).sum(1).bfloat16()
-    diff = standard.float() - ref.float()
-    normalized_rmse = diff.norm() / ref.float().norm().clamp_min(1e-20)
-    assert normalized_rmse.item() < 0.02, normalized_rmse.item()
-
-    # Check both replay and updated inputs/routing using the real model shape.
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            e2e()
-    stream.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        captured = e2e()
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(captured, standard, atol=0, rtol=0)
-    x.mul_(0.5)
-    ids.copy_((ids + 1) % E)
-    updated = e2e()
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(captured, updated, atol=0, rtol=0)
-    print(f"B={B} E={E} topk={topk} H={hidden} I={inter}: "
-          f"staged==standard, FP32 NRMSE={normalized_rmse.item():.5f}, graph passed")
+def sglang_reference(x, gu, dn, gs, ds, ids, route):
+    # Keep SGLang's quantized inputs, independently evaluate the projections.
+    q, xs = sglang_per_token_group_quant_fp8(x, 128)
+    buf = gate_reference(q, gu, xs, gs, ids)
+    q2, s2 = sglang_per_token_group_quant_fp8(buf, 128)
+    return down_reference(q2, dn, s2, ds, ids, route)
 
 
 def main():
     initialize_sglang()
-    cases = [(1, 4, 1, 256, 64), (3, 8, 2, 512, 128)]
-    cases += [(B, 128, 8, 4096, 192) for B in [1, 8, 16, 32, 64]]
-    cases += [(4, 128, 8, 4096, 384)]
-    for case in cases:
-        run_case(*case)
-    print("all 8 standard-reference cases passed")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    gu, dn, gs, ds = make_weights()
+    runner = MoeRunnerConfig(num_experts=256, num_local_experts=256, top_k=8,
+                             inplace=False, gate_up_interleaved=False)
+    for b in [1, 16, 64]:
+        x, ids, route = make_inputs(b)
+        topk = StandardTopKOutput(route, ids, None)
+        def fn():
+            return fused_experts(x, gu, dn, topk, runner, use_fp8_w8a8=True,
+                                 w1_scale=gs, w2_scale=ds, block_shape=[128,128])
+        # BF16 GEMM/SiLU rounding can cross FP8 requantization boundaries.
+        # Allow 1% for the full SGLang path; native stage limits are separate.
+        accuracy = metrics(fn(), sglang_reference(x, gu, dn, gs, ds, ids, route), .01)
+        metrics(wd.moe_ffn_3d_batched(x, gu, dn, gs, ds, ids, route),
+                ffn_reference(x, gu, dn, gs, ds, ids, route))
+        def mutate():
+            x.mul_(-1.03)
+            ids.copy_(ids.roll(1, -1)); route.copy_(route.roll(1, -1))
+            gs.mul_(1.001); ds.mul_(.999)
+        graph_test(fn, mutate)
+        metrics(fn(), sglang_reference(x, gu, dn, gs, ds, ids, route), .01)
+        print('PASS SGLang FP8 reference + graph', b, accuracy, flush=True)
+    print('All SGLang FP8 reference tests passed', flush=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

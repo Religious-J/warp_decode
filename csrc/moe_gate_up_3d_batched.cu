@@ -1,48 +1,38 @@
-// warp_decode: gate_up kernel for BF16 MoE decode.
+// warp_decode: gate_up kernel for blockwise FP8 MoE decode.
 //
-// Layout (matches sglang fused_moe / bench_bf16_fuse_moe.py):
-//   X   : [B, hidden]                  bf16
-//   W   : [E, 2 * inter, hidden]       bf16       (rows [0, inter) = gate == W1,
-//                                                  rows [inter, 2*inter) = up  == W3)
-//   ids : [B, topk]                    int32
-//   out : [B * topk, inter]            bf16       (== silu(gate) * up, fused)
+// Layout (Qwen3.6-35B-A3B, TP=1):
+//   X       : [B, hidden]                  fp8 e4m3
+//   W       : [E, 2 * inter, hidden]       fp8 e4m3 (gate rows, then up rows)
+//   x_scale : [B, hidden / 128]            fp32
+//   w_scale : [E, 2 * inter / 128, hidden / 128] fp32
+//   ids     : [B, topk]                    int32
+//   out     : [B * topk, inter]            bf16 (silu(gate) * up, fused)
 //
 // Parallelism (warp-per-neuron):
-//   gridDim.x = B * topk                 (one CTA per (token, topk_slot))
-//   gridDim.y = inter / WARPS_PER_CTA    (each CTA covers WARPS_PER_CTA neurons)
-//   blockDim.x = WARPS_PER_CTA * 32
-//   Each warp owns one output neuron n \in [0, inter), computes
-//       g = sum_k x[token, k] * W[expert, n,        k]
-//       u = sum_k x[token, k] * W[expert, n+inter,  k]
-//       ou2u(g) * u
-//
-// Notes:
-//   * All 8 warps read x[token] directly from global memory; caches provide reuse.
-//   * hidden must be a multiple of 32 * VEC = 256 (VEC = 8 bf16 per uint4 load).
-//   * inter must be a multiple of WARPS_PER_CTA (=8 by default).
+//   gridDim.x = B * topk; gridDim.y = inter / WARPS_PER_CTA.
+//   Each warp streams one gate/up weight row and reads X through the cache.
+//   FP8 pairs are widened before FP32 accumulation; each vector stays within
+//   one 128-element scale group. Gate/up rounds to BF16 before activation.
 
-
-#include <cuda_runtime.h>
+#include "moe_3d_batched.h"
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <c10/cuda/CUDAException.h>
 #include <cstdint>
 
 namespace warp_decode {
+namespace {
 
-constexpr int WARPS_PER_CTA   = 8;
+constexpr int HIDDEN_SIZE     = 2048;
+constexpr int INTER_SIZE      = 512;
+constexpr int NUM_EXPERTS     = 256;
+constexpr int TOPK            = 8;
+constexpr int SCALE_GROUP     = 128;
+constexpr int WARPS_PER_CTA   = 4;
 constexpr int THREADS_PER_CTA = WARPS_PER_CTA * 32;
-constexpr int VEC             = 8;   // 8 bf16 == 16 B == uint4
-static_assert(VEC == 8, "uint4 loads must contain exactly 8 BF16 values");
+constexpr int VEC             = 16;  // 16 FP8 values == 16 B == uint4
 
-// BF16 is the high 16 bits of FP32. Expanding both packed halves directly
-// avoids extracting each 16-bit value before converting it to FP32.
-__device__ __forceinline__ float2 unpack_bf16_pair(uint32_t packed) {
-    return make_float2(__uint_as_float(packed << 16),
-                      __uint_as_float(packed & 0xffff0000u));
-}
-
-__device__ __forceinline__ float silu_f32(float x) {
-    return x / (1.0f + __expf(-x));
-}
+using fp8 = __nv_fp8_e4m3;
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
     // full warp reduction via xor butterfly
@@ -54,85 +44,162 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
     return v;
 }
 
-__global__ void moe_gate_up_3d_batched_kernel(
-    const __nv_bfloat16* __restrict__ X,        // [B, hidden]
-    const __nv_bfloat16* __restrict__ W,        // [E, 2*inter, hidden]
-    const int*           __restrict__ topk_ids, // [B, topk]
-    __nv_bfloat16*       __restrict__ out,      // [B*topk, inter]
-    int B, int E, int topk, int hidden, int inter)
-{
-    const int flat_tok = blockIdx.x;                 // in [0, B*topk)
-    const int token_id = flat_tok / topk;
-    const int slot     = flat_tok - token_id * topk;
+__device__ __forceinline__ float warp_reduce_max(float v) {
+    #pragma unroll
+    for (int d = 16; d; d /= 2) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, d));
+    }
+    return v;
+}
 
+__device__ __forceinline__ float2 unpack_fp8_pair(uint16_t packed) {
+    return __half22float2(static_cast<__half2>(
+        __nv_cvt_fp8x2_to_halfraw2(packed, __NV_E4M3)));
+}
+
+__device__ __forceinline__ float silu_f32(float x) {
+    return x / (1.0f + __expf(-x));
+}
+
+__global__ void quantize_fp8_blockwise_kernel(
+    const __nv_bfloat16* X,    // [rows, cols]
+    fp8*                out,  // [rows, cols]
+    float*              scale, // [rows, cols / SCALE_GROUP]
+    int rows, int cols)
+{
+    const int lane_id = threadIdx.x & 31;
+    const size_t group = (size_t)blockIdx.x * WARPS_PER_CTA + threadIdx.x / 32;
+    if (group >= (size_t)rows * (cols / SCALE_GROUP)) return;
+
+    // Each warp quantizes one group; four adjacent BF16 elements per lane.
+    const size_t offset = group * SCALE_GROUP + lane_id * 4;
+    uint2 packed = *reinterpret_cast<const uint2*>(X + offset);
+    const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed);
+    float xf[4];
+    float max_abs = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        xf[i] = __bfloat162float(values[i]);
+        max_abs = fmaxf(max_abs, fabsf(xf[i]));
+    }
+
+    const float group_scale = __fdiv_rn(fmaxf(warp_reduce_max(max_abs), 1.e-10f), 448.f);
+    if (lane_id == 0) scale[group] = group_scale;
+    const float inv_scale = __fdiv_rn(1.f, group_scale);
+    __nv_fp8x2_e4m3 lo(make_float2(xf[0] * inv_scale, xf[1] * inv_scale));
+    __nv_fp8x2_e4m3 hi(make_float2(xf[2] * inv_scale, xf[3] * inv_scale));
+    *reinterpret_cast<uint32_t*>(out + offset) = uint32_t(lo.__x) | (uint32_t(hi.__x) << 16);
+}
+
+__global__ void moe_gate_up_3d_batched_kernel(
+    const fp8*     X,        // [B, hidden]
+    const fp8*     W,        // [E, 2*inter, hidden]
+    const float*   x_scale,  // [B, hidden / SCALE_GROUP]
+    const float*   w_scale,  // [E, 2*inter / SCALE_GROUP, hidden / SCALE_GROUP]
+    const int*     topk_ids, // [B, topk]
+    __nv_bfloat16* out)      // [B*topk, inter]
+{
+    const int flat_tok = blockIdx.x;
+    const int token_id = flat_tok / TOPK;
     const int warp_id  = threadIdx.x >> 5;
     const int lane_id  = threadIdx.x & 31;
-
     const int neuron_n = blockIdx.y * WARPS_PER_CTA + warp_id;
-    // Boundary guard for inter % WARPS_PER_CTA != 0 (currently we assert host-side).
-    if (neuron_n >= inter) return;
+    const int expert_id = topk_ids[flat_tok];
 
-    const int expert_id = topk_ids[token_id * topk + slot];
+    if (expert_id < 0 || expert_id >= NUM_EXPERTS) {
+        if (lane_id == 0) {
+            out[(size_t)flat_tok * INTER_SIZE + neuron_n] = __float2bfloat16_rn(nanf(""));
+        }
+        return;
+    }
 
-    // All warps use the same token row. Read it directly through the cache
-    // hierarchy instead of cooperatively staging it in shared memory.
-    const __nv_bfloat16* __restrict__ x_ptr = X + (size_t)token_id * hidden;
-
-    // Each warp streams its gate/up weight rows and computes both dot products.
-    const size_t expert_stride = (size_t)(2 * inter) * hidden;
-    const __nv_bfloat16* __restrict__ gate_ptr =
-        W + (size_t)expert_id * expert_stride + (size_t)neuron_n * hidden;
-    const __nv_bfloat16* __restrict__ up_ptr   =
-        gate_ptr + (size_t)inter * hidden;
+    const fp8* x_ptr = X + (size_t)token_id * HIDDEN_SIZE;
+    const size_t expert_stride = (size_t)(2 * INTER_SIZE) * HIDDEN_SIZE;
+    const fp8* gate_ptr = W + (size_t)expert_id * expert_stride + (size_t)neuron_n * HIDDEN_SIZE;
+    const fp8* up_ptr   = gate_ptr + (size_t)INTER_SIZE * HIDDEN_SIZE;
+    const float* gate_scale = w_scale +
+        ((size_t)expert_id * (2 * INTER_SIZE / SCALE_GROUP) + neuron_n / SCALE_GROUP) *
+        (HIDDEN_SIZE / SCALE_GROUP);
+    const float* up_scale = gate_scale + (INTER_SIZE / SCALE_GROUP) * (HIDDEN_SIZE / SCALE_GROUP);
 
     float acc_gate = 0.f;
     float acc_up   = 0.f;
 
-    #pragma unroll 1
-    for (int k = lane_id * VEC; k < hidden; k += 32 * VEC) {
+    #pragma unroll
+    for (int k = lane_id * VEC; k < HIDDEN_SIZE; k += 32 * VEC) {
         uint4 xv = *reinterpret_cast<const uint4*>(&x_ptr[k]);
         uint4 gv = *reinterpret_cast<const uint4*>(&gate_ptr[k]);
         uint4 uv = *reinterpret_cast<const uint4*>(&up_ptr[k]);
 
-        const uint32_t x_words[VEC / 2] = {xv.x, xv.y, xv.z, xv.w};
-        const uint32_t g_words[VEC / 2] = {gv.x, gv.y, gv.z, gv.w};
-        const uint32_t u_words[VEC / 2] = {uv.x, uv.y, uv.z, uv.w};
+        const auto* x_pairs = reinterpret_cast<const uint16_t*>(&xv);
+        const auto* g_pairs = reinterpret_cast<const uint16_t*>(&gv);
+        const auto* u_pairs = reinterpret_cast<const uint16_t*>(&uv);
+        float local_gate = 0.f;
+        float local_up   = 0.f;
 
-        // Unrolling keeps the packed words in registers. Preserve the original
-        // even/odd element order and perform all multiplication/summing in FP32.
         #pragma unroll
         for (int i = 0; i < VEC / 2; ++i) {
-            const float2 xf = unpack_bf16_pair(x_words[i]);
-            const float2 gf = unpack_bf16_pair(g_words[i]);
-            const float2 uf = unpack_bf16_pair(u_words[i]);
-            acc_gate += xf.x * gf.x;
-            acc_up   += xf.x * uf.x;
-            acc_gate += xf.y * gf.y;
-            acc_up   += xf.y * uf.y;
+            const float2 xf = unpack_fp8_pair(x_pairs[i]);
+            const float2 gf = unpack_fp8_pair(g_pairs[i]);
+            const float2 uf = unpack_fp8_pair(u_pairs[i]);
+            local_gate = fmaf(xf.x, gf.x, local_gate);
+            local_gate = fmaf(xf.y, gf.y, local_gate);
+            local_up   = fmaf(xf.x, uf.x, local_up);
+            local_up   = fmaf(xf.y, uf.y, local_up);
         }
+
+        const float scale = x_scale[(size_t)token_id * (HIDDEN_SIZE / SCALE_GROUP) + k / SCALE_GROUP];
+        acc_gate = fmaf(local_gate, scale * gate_scale[k / SCALE_GROUP], acc_gate);
+        acc_up   = fmaf(local_up,   scale * up_scale[k / SCALE_GROUP],   acc_up);
     }
 
     acc_gate = warp_reduce_sum(acc_gate);
     acc_up   = warp_reduce_sum(acc_up);
 
     if (lane_id == 0) {
-        float y = silu_f32(acc_gate) * acc_up;
-        out[(size_t)flat_tok * inter + neuron_n] = __float2bfloat16(y);
+        // Match the BF16 GEMM boundary before SGLang's SiLU-and-multiply.
+        acc_gate = __bfloat162float(__float2bfloat16_rn(acc_gate));
+        acc_up   = __bfloat162float(__float2bfloat16_rn(acc_up));
+        const float y = silu_f32(acc_gate) * acc_up;
+        out[(size_t)flat_tok * INTER_SIZE + neuron_n] = __float2bfloat16_rn(y);
     }
 }
 
-void launch_moe_gate_up_3d_batched(
-    const __nv_bfloat16* X,
-    const __nv_bfloat16* W,
-    const int*           topk_ids,
-    __nv_bfloat16*       out,
-    int B, int E, int topk, int hidden, int inter,
+}  // anonymous namespace
+
+void launch_quantize_fp8_blockwise(
+    const void* X,
+    void*       out,
+    float*      scale,
+    int rows, int cols,
     cudaStream_t stream)
 {
-    dim3 grid(B * topk, inter / WARPS_PER_CTA);
+    if (!rows || !cols) return;
+    const size_t total_groups = (size_t)rows * (cols / SCALE_GROUP);
+    dim3 grid((total_groups + WARPS_PER_CTA - 1) / WARPS_PER_CTA);
+    dim3 block(THREADS_PER_CTA);
+    quantize_fp8_blockwise_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(X), static_cast<fp8*>(out), scale, rows, cols);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_moe_gate_up_3d_batched(
+    const void*  X,
+    const void*  W,
+    const float* x_scale,
+    const float* w_scale,
+    const int*   topk_ids,
+    void*        out,
+    int B,
+    cudaStream_t stream)
+{
+    if (!B) return;
+    dim3 grid(B * TOPK, INTER_SIZE / WARPS_PER_CTA);
     dim3 block(THREADS_PER_CTA);
     moe_gate_up_3d_batched_kernel<<<grid, block, 0, stream>>>(
-        X, W, topk_ids, out, B, E, topk, hidden, inter);
+        static_cast<const fp8*>(X), static_cast<const fp8*>(W), x_scale, w_scale,
+        topk_ids, static_cast<__nv_bfloat16*>(out));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace warp_decode

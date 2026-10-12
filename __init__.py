@@ -2,7 +2,7 @@
 
 Usage:
     from warp_decode import warp_decode as wd
-    out = wd.moe_gate_up_3d_batched(x, w, topk_ids)
+    out = wd.moe_gate_up_3d_batched(x, w, w_scale, topk_ids)
 """
 
 import os

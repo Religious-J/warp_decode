@@ -1,51 +1,46 @@
-"""Benchmark warp_decode kernels against a sglang triton reference.
+"""Benchmark warp_decode FP8 FFN against the SGLang Triton reference.
 
-Three modes (default: all):
-  gate_up : warp_decode.moe_gate_up_3d_batched  vs  triton gate_up + silu_and_mul
-  down    : warp_decode.moe_down_3d_batched      vs  triton down + sum-reduce
-  e2e     : gate_up + down (warp_decode)         vs  full sglang MoE pipeline
+Fixed Qwen3.6 TP1 shape: hidden=2048, intermediate=512, experts=256, topk=8.
+Both implementations include dynamic activation quantization and use supplied
+FP8 weights with FP32 block scales. Weights stay at fixed addresses.
 
 Run from the repo root:
     python benchmark/bench.py --batches 1,2,4,8,16,32,64
 """
 
 import argparse
+import hashlib
+import importlib.metadata
+import json
+import random
+import statistics
+import subprocess
 import sys
 from pathlib import Path
 
-# Make the `warp_decode` package importable regardless of CWD.
-# Repo layout: <repo>/warp_decode/benchmark/bench.py  ->  parents[2] = <repo>
+# Make the package and shared test inputs importable regardless of CWD.
 _repo_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_repo_root))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 
 import torch
-import triton.language as tl
-
 import sglang
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-    invoke_fused_moe_kernel,
-)
+import triton
+
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args, publish
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     try_get_optimal_moe_config,
 )
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-    fused_experts,
-    moe_sum_reduce_torch_compile,
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
-    moe_align_block_size,
-)
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.server_args import (
-    ServerArgs,
-    get_global_server_args,
-    set_global_server_args_for_scheduler,
-)
-from sglang.jit_kernel.activation import silu_and_mul
-from sgl_kernel import moe_sum_reduce
 
 from warp_decode import warp_decode as wd
+from fp8_reference import make_weights, make_inputs, ffn_reference, metrics
 
 
 # ---------------------------------------------------------------------------
@@ -54,308 +49,230 @@ from warp_decode import warp_decode as wd
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--hidden-size", type=int, default=4096)
-    p.add_argument("--intermediate-size", type=int, default=1536,
-                   help="moe_intermediate_size per expert BEFORE TP split")
-    p.add_argument("--num-experts", type=int, default=128)
-    p.add_argument("--topk", type=int, default=8)
-    p.add_argument("--tp-size", type=int, default=8)
-    p.add_argument("--warmup", type=int, default=25)
-    p.add_argument("--iters", type=int, default=100)
-    p.add_argument("--mode", choices=["gate_up", "down", "e2e", "all"], default="all")
-    p.add_argument("--batches", type=str, default="1..64",
-                   help='e.g. "1..64", "16,32,64,128", "16..512:16"')
+    p.add_argument("--batches", default="1,2,4,8,16,32,64")
+    p.add_argument("--seed", type=int, default=20261012)
+    p.add_argument("--rounds", type=int, default=7)
+    p.add_argument("--iters", type=int, default=200)
+    p.add_argument("--calls-per-graph", type=int, default=16)
+    p.add_argument("--output", default="fp8_blockwise.json")
     return p.parse_args()
-
-
-def parse_batches(spec):
-    if ":" in spec:
-        rng, step = spec.split(":")
-        a, b = rng.split("..")
-        return list(range(int(a), int(b) + 1, int(step)))
-    if ".." in spec:
-        a, b = spec.split("..")
-        return list(range(int(a), int(b) + 1))
-    return [int(x) for x in spec.split(",")]
 
 
 # ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
 
-def make_inputs(B, hidden, inter, E_local, topk, device="cuda"):
-    dtype = torch.bfloat16
-    x = torch.randn(B, hidden, dtype=dtype, device=device)
-    gate_up_w  = torch.randn(E_local, 2 * inter, hidden, dtype=dtype, device=device)
-    down_w     = torch.randn(E_local, hidden, inter,    dtype=dtype, device=device)
-    # Real top-k routing selects distinct experts for each token.
-    if not 1 <= topk <= E_local:
-        raise ValueError("topk must be between 1 and num_experts")
-    topk_ids = torch.rand(B, E_local, device=device).topk(topk, dim=1).indices
-    topk_ids = topk_ids.to(torch.int32).contiguous()
-    raw        = torch.rand(B, topk, dtype=torch.float32, device=device)
-    topk_scale = raw / raw.sum(dim=1, keepdim=True)
-    return x, gate_up_w, down_w, topk_ids, topk_scale
+def make_e2e_inputs(batch):
+    x, ids, route = make_inputs(batch)
+    topk = StandardTopKOutput(route, ids, None)
+    return x, ids, route, topk
 
 
 # ---------------------------------------------------------------------------
 # Bench helper (CUDA graph)
 # ---------------------------------------------------------------------------
 
-def bench_cuda_graph(fn, warmup, iters):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    g = torch.cuda.CUDAGraph()
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        fn()
-        torch.cuda.synchronize()
-        with torch.cuda.graph(g, stream=stream):
-            fn()
-    torch.cuda.synchronize()
-
-    t0 = torch.cuda.Event(enable_timing=True)
-    t1 = torch.cuda.Event(enable_timing=True)
-    t0.record()
-    for _ in range(iters):
-        g.replay()
-    t1.record()
-    torch.cuda.synchronize()
-    return t0.elapsed_time(t1) / iters
-
 
 def initialize_sglang():
     """Use declared server defaults without loading a model or starting a server."""
     try:
-        get_global_server_args()
+        get_server_args()
     except ValueError:
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", moe_runner_backend="triton")
+        publish(
+            ServerArgs(model_path="dummy", moe_runner_backend="triton"),
+            role="test",
         )
+        assert not get_exec().comm.enable_symm_mem
+        assert not get_exec().moe.enable_fused_moe_sum_all_reduce
+        get_parallel().override_permanently(tp_group=None)
 
 
-def sglang_bf16_configs(B, gate_up_shape, down_shape, topk):
-    """Use SGLang's device/shape config lookup with original batch size M=B."""
-    initialize_sglang()
-    config, (down_config, _) = try_get_optimal_moe_config(
-        gate_up_shape, down_shape, topk, None, B, return_down_config=True,
-    )
-    return dict(config), dict(down_config or config)
+def capture(fn, calls):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(30):
+            fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for _ in range(calls):
+            out = fn()
+    torch.cuda.synchronize()
+    return graph, out
 
 
-def _invoke_bf16(a, w, out, ids, scale, routing, config, mul_weight, topk):
-    invoke_fused_moe_kernel(
-        a, w, None, out, None, None, None, scale, ids, *routing,
-        mul_weight, topk, config,
-        compute_type=tl.bfloat16,
-        use_fp8_w8a8=False, use_int8_w8a8=False,
-        use_int8_w8a16=False, use_int4_w4a16=False,
-        per_channel_quant=False, block_shape=None, filter_expert=False,
-    )
-
-
-# ---------------------------------------------------------------------------
-# gate_up bench
-# ---------------------------------------------------------------------------
-
-def bench_gate_up_wd(x, gate_up_w, topk_ids, warmup, iters):
-    def fn():
-        wd.moe_gate_up_3d_batched(x, gate_up_w, topk_ids)
-    return bench_cuda_graph(fn, warmup, iters)
-
-
-def make_gate_up_sgl(x, gate_up_w, topk_ids, topk_scale):
-    B, hidden = x.shape
-    E, two_inter, _ = gate_up_w.shape
-    inter = two_inter // 2
-    topk = topk_ids.shape[1]
-    config, _ = sglang_bf16_configs(
-        B, gate_up_w.shape, (E, hidden, inter), topk,
-    )
-    # Routing has padded indices; activation rows are logical token/slot rows.
-    cache1 = torch.empty(B * topk, 2 * inter, dtype=x.dtype, device=x.device)
-    cache2 = torch.empty(B * topk, inter, dtype=x.dtype, device=x.device)
-
-    def fn():
-        routing = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
-        _invoke_bf16(x, gate_up_w, cache1, topk_ids, topk_scale,
-                     routing, config, False, topk)
-        silu_and_mul(cache1, cache2)
-        return cache2
-
-    return fn
-
-
-def bench_gate_up_sgl(x, gate_up_w, topk_ids, topk_scale, E_local, warmup, iters):
-    assert E_local == gate_up_w.shape[0]
-    return bench_cuda_graph(
-        make_gate_up_sgl(x, gate_up_w, topk_ids, topk_scale), warmup, iters,
-    )
-
-
-# ---------------------------------------------------------------------------
-# down bench
-# ---------------------------------------------------------------------------
-
-def bench_down_wd(buffer, down_w, topk_ids, topk_scale, warmup, iters):
-    B = topk_scale.shape[0]
-    def fn():
-        wd.moe_down_3d_batched(buffer, down_w, topk_ids, topk_scale, B)
-    return bench_cuda_graph(fn, warmup, iters)
-
-
-def make_down_sgl(buffer, down_w, topk_ids, topk_scale):
-    """Standard down config and combine kernels, with routing included in timing."""
-    B, topk = topk_ids.shape
-    E, hidden, inter = down_w.shape
-    config, down_config = sglang_bf16_configs(
-        B, (E, 2 * inter, hidden), down_w.shape, topk,
-    )
-    if down_config.get("USE_TMA", False):
-        raise NotImplementedError(
-            "Standalone down uses unsorted activations; use --mode e2e "
-            "for SGLang's sorted TMA path."
-        )
-    cache3 = torch.empty(B, topk, hidden, dtype=buffer.dtype, device=buffer.device)
-    out = torch.empty(B, hidden, dtype=buffer.dtype, device=buffer.device)
-
-    def fn():
-        routing = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
-        _invoke_bf16(buffer, down_w, out.unsqueeze(0) if topk == 1 else cache3,
-                     topk_ids, topk_scale, routing, down_config, True, 1)
-        if topk == 2:
-            torch.add(cache3[:, 0], cache3[:, 1], out=out)
-        elif topk > 2:
-            if B <= 32:
-                moe_sum_reduce_torch_compile(cache3, out, 1.0)
-            else:
-                moe_sum_reduce(cache3, out, 1.0)
-        return out
-
-    return fn
-
-
-def bench_down_sgl(buffer, down_w, topk_ids, topk_scale, E_local, warmup, iters):
-    assert E_local == down_w.shape[0]
-    return bench_cuda_graph(
-        make_down_sgl(buffer, down_w, topk_ids, topk_scale), warmup, iters,
-    )
+def measure(graph, calls, replays):
+    for _ in range(20):
+        graph.replay()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(replays):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / (calls * replays)
 
 
 # ---------------------------------------------------------------------------
 # e2e bench
 # ---------------------------------------------------------------------------
 
-def bench_e2e_wd(x, gate_up_w, down_w, topk_ids, topk_scale, warmup, iters):
-    B = x.shape[0]
+def make_e2e_wd(x, gate_up_w, down_w, gate_up_scale, down_scale, ids, route):
     def fn():
-        buf = wd.moe_gate_up_3d_batched(x, gate_up_w, topk_ids)
-        wd.moe_down_3d_batched(buf, down_w, topk_ids, topk_scale, B)
-    return bench_cuda_graph(fn, warmup, iters)
-
-
-def make_e2e_sgl(x, gate_up_w, down_w, topk_ids, topk_scale):
-    """Call the standard SGLang Triton FFN, including routing and combine."""
-    initialize_sglang()
-    E = gate_up_w.shape[0]
-    runner_config = MoeRunnerConfig(
-        num_experts=E, num_local_experts=E,
-        top_k=topk_ids.shape[1], inplace=False,
-    )
-    topk_output = StandardTopKOutput(topk_scale, topk_ids, None)
-
-    def fn():
-        return fused_experts(x, gate_up_w, down_w, topk_output, runner_config)
-
+        return wd.moe_ffn_3d_batched(
+            x, gate_up_w, down_w, gate_up_scale, down_scale, ids, route,
+        )
     return fn
 
 
-def bench_e2e_sgl(x, gate_up_w, down_w, topk_ids, topk_scale, E_local, warmup, iters):
-    assert E_local == gate_up_w.shape[0]
-    return bench_cuda_graph(
-        make_e2e_sgl(x, gate_up_w, down_w, topk_ids, topk_scale), warmup, iters,
-    )
+def make_e2e_sgl(x, gate_up_w, down_w, gate_up_scale, down_scale, topk, runner):
+    """Call the standard SGLang Triton FP8 FFN, including routing and combine."""
+    def fn():
+        return fused_experts(
+            x, gate_up_w, down_w, topk, runner,
+            use_fp8_w8a8=True,
+            w1_scale=gate_up_scale, w2_scale=down_scale, block_shape=[128, 128],
+        )
+    return fn
 
 
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_mode(name, B_list, args, hidden, inter, E_local, topk, wd_call, sgl_call):
-    print(f"\n=== {name} ===")
-    hdr = (f"{'batch':>6}  {'toks':>6}  "
-           f"{'wd(ms)':>10}  {'sgl(ms)':>10}  {'speedup':>8}")
-    print(hdr)
-    print("-" * len(hdr))
-
-    for B in B_list:
-        x, gate_up_w, down_w, ids, scale = make_inputs(
-            B, hidden, inter, E_local, topk
-        )
-        wd_ms  = wd_call (x, gate_up_w, down_w, ids, scale, args.warmup, args.iters)
-        sgl_ms = sgl_call(x, gate_up_w, down_w, ids, scale, args.warmup, args.iters)
-
-        print(f"{B:>6}  {B*topk:>6}  "
-              f"{wd_ms:>10.4f}  {sgl_ms:>10.4f}  {sgl_ms/wd_ms:>7.2f}x")
-
-
 def main():
     args = parse_args()
-    hidden = args.hidden_size
-    if args.tp_size <= 0 or args.intermediate_size % args.tp_size:
-        raise ValueError("intermediate-size must be divisible by a positive tp-size")
-    inter  = args.intermediate_size // args.tp_size
-    E_local = args.num_experts     # matches sglang bench: TP shards only inter
-    topk = args.topk
-    B_list = parse_batches(args.batches)
-
+    if min(args.rounds, args.iters, args.calls_per_graph) < 1:
+        raise ValueError("rounds, iters and calls-per-graph must be positive")
     initialize_sglang()
-    torch.manual_seed(0)
-
-    dev = torch.cuda.get_device_properties(0)
-
-    print(f"\ndevice        : {dev.name}")
-    print(f"reference     : SGLang {sglang.__version__} standard Triton path")
-    print(f"config        : hidden={hidden} inter={inter} E_local={E_local} topk={topk}")
-    print(f"weights       : gate_up={E_local*2*inter*hidden*2/1e6:.1f} MB, "
-          f"down={E_local*hidden*inter*2/1e6:.1f} MB")
-
-    for B in B_list:
-        up_config, down_config = sglang_bf16_configs(
-            B, (E_local, 2 * inter, hidden), (E_local, hidden, inter), topk,
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.manual_seed(args.seed)
+    rng = random.Random(args.seed)
+    gu, dn, gs, ds = make_weights(args.seed)
+    root = Path(__file__).resolve().parents[1]
+    result = dict(
+        gpu=torch.cuda.get_device_name(),
+        torch=torch.__version__,
+        cuda=torch.version.cuda,
+        sglang=sglang.__version__,
+        sgl_kernel=importlib.metadata.version("sglang-kernel"),
+        triton=triton.__version__,
+        seed=args.seed,
+        shape=dict(hidden=2048, inter=512, experts=256, topk=8, tp=1),
+        layout="E4M3 W8A8; activation 1x128; weight 128x128; FP32 scales",
+        protocol=dict(
+            rounds=args.rounds,
+            replays=args.iters,
+            calls_per_graph=args.calls_per_graph,
+            weights="fixed addresses; no rotation/cache flush",
+            clocks="dynamic",
+            graph_update_inputs="restored before timing",
+            scope="FFN includes activation quantization and combine; excludes weight setup and router",
+        ),
+        source_hashes={
+            str(f.relative_to(root)): hashlib.sha256(f.read_bytes()).hexdigest()
+            for f in [
+                root / "csrc/moe_gate_up_3d_batched.cu",
+                root / "csrc/moe_down_3d_batched.cu",
+                root / "csrc/moe_3d_batched.h",
+                root / "csrc/binding.cpp",
+                root / "__init__.py",
+                root / "tests/fp8_reference.py",
+                Path(__file__),
+            ]
+        },
+        gpu_start=subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=clocks.sm,temperature.gpu,power.draw",
+                "--format=csv,noheader",
+            ],
+            text=True,
+        ).strip(),
+        cases=[],
+    )
+    runner = MoeRunnerConfig(
+        num_experts=256, num_local_experts=256, top_k=8,
+        inplace=False, gate_up_interleaved=False,
+    )
+    print("Stack:", result["torch"], result["sglang"], result["triton"], flush=True)
+    for b in map(int, args.batches.split(",")):
+        if b <= 0:
+            raise ValueError("benchmark batch must be positive")
+        x, ids, route, topk = make_e2e_inputs(b)
+        native = make_e2e_wd(x, gu, dn, gs, ds, ids, route)
+        sgl = make_e2e_sgl(x, gu, dn, gs, ds, topk, runner)
+        expected = ffn_reference(x, gu, dn, gs, ds, ids, route)
+        validation = {
+            "warp_decode_fp8": metrics(native(), expected),
+            "sglang_fp8": metrics(sgl(), expected, .02),
+        }
+        q, _ = wd.quantize_fp8_blockwise(x)
+        sq, _ = sglang_per_token_group_quant_fp8(x, 128)
+        validation["sglang_quant_byte_differences"] = (
+            (q.view(torch.uint8) != sq.view(torch.uint8)).sum().item()
         )
-        print(f"sglang config : B={B} gate_up={up_config} down={down_config}")
-
-    modes = ["gate_up", "down", "e2e"] if args.mode == "all" else [args.mode]
-
-    # signature adapters: (x, gate_up_w, down_w, ids, scale, warmup, iters) -> ms
-    def _wd_gu (x, gu, dn, ids, sc, w, i): return bench_gate_up_wd (x, gu, ids, w, i)
-    def _sgl_gu(x, gu, dn, ids, sc, w, i): return bench_gate_up_sgl(x, gu, ids, sc, E_local, w, i)
-
-    def _wd_dn (x, gu, dn, ids, sc, w, i):
-        # Use a real gate_up output so the L2 state during the down bench is
-        # representative of the e2e path.
-        buf = wd.moe_gate_up_3d_batched(x, gu, ids)
-        return bench_down_wd(buf, dn, ids, sc, w, i)
-
-    def _sgl_dn(x, gu, dn, ids, sc, w, i):
-        buf = wd.moe_gate_up_3d_batched(x, gu, ids)
-        return bench_down_sgl(buf, dn, ids, sc, E_local, w, i)
-
-    def _wd_e2e (x, gu, dn, ids, sc, w, i): return bench_e2e_wd (x, gu, dn, ids, sc,           w, i)
-    def _sgl_e2e(x, gu, dn, ids, sc, w, i): return bench_e2e_sgl(x, gu, dn, ids, sc, E_local, w, i)
-
-    if "gate_up" in modes:
-        run_mode("gate_up  (warp_decode vs triton gate_up + silu_and_mul)",
-                 B_list, args, hidden, inter, E_local, topk, _wd_gu, _sgl_gu)
-    if "down" in modes:
-        run_mode("down     (warp_decode vs triton down + sum-reduce)",
-                 B_list, args, hidden, inter, E_local, topk, _wd_dn, _sgl_dn)
-    if "e2e" in modes:
-        run_mode("e2e      (warp_decode gate_up+down vs full sglang pipeline)",
-                 B_list, args, hidden, inter, E_local, topk, _wd_e2e, _sgl_e2e)
+        config, (down_config, _) = try_get_optimal_moe_config(
+            gu.shape, dn.shape, 8, "fp8_w8a8", b,
+            block_shape=[128, 128], return_down_config=True,
+        )
+        fns = {"warp_decode_fp8": native, "sglang_fp8": sgl}
+        graphs = {
+            name: capture(fn, args.calls_per_graph) for name, fn in fns.items()
+        }
+        # Verify graph updates, then restore the fixture before timing.
+        original_inputs = [(tensor, tensor.clone()) for tensor in (x, gs, ds, ids, route)]
+        x.mul_(-1.03)
+        gs.mul_(1.001)
+        ds.mul_(.999)
+        ids.copy_(ids.roll(1, -1))
+        route.copy_(route.roll(1, -1))
+        # Alter actual FP8 weight bytes in an expert guaranteed to be routed.
+        expert = ids[0, 0].item()
+        original = gu[expert, 0, :128].clone()
+        gu[expert, 0, :128].copy_((-original.float()).to(gu.dtype))
+        for name, (graph, out) in graphs.items():
+            graph.replay()
+            torch.testing.assert_close(out, fns[name](), rtol=0, atol=0)
+        gu[expert, 0, :128].copy_(original)
+        for tensor, value in original_inputs:
+            tensor.copy_(value)
+        for name, (graph, out) in graphs.items():
+            graph.replay()
+            torch.testing.assert_close(out, fns[name](), rtol=0, atol=0)
+        validation["graph_update_and_restore"] = True
+        # Validate on the exact values used for timing as well.
+        expected = ffn_reference(x, gu, dn, gs, ds, ids, route)
+        validation["timed_native"] = metrics(native(), expected)
+        validation["timed_sglang"] = metrics(sgl(), expected, .02)
+        samples = {name: [] for name in fns}
+        order = []
+        for _ in range(args.rounds):
+            names = list(fns)
+            rng.shuffle(names)
+            order.append(names)
+            for name in names:
+                samples[name].append(
+                    measure(graphs[name][0], args.calls_per_graph, args.iters)
+                )
+        medians = {
+            name: statistics.median(values) for name, values in samples.items()
+        }
+        result["cases"].append(dict(
+            batch=b,
+            ids=ids.cpu().tolist(),
+            config=config,
+            down_config=down_config,
+            validation=validation,
+            order=order,
+            samples_ms=samples,
+            median_ms=medians,
+            speedup=medians["sglang_fp8"] / medians["warp_decode_fp8"],
+        ))
+        Path(args.output).write_text(json.dumps(result, indent=2) + "\n")
+        print("B", b, medians, "speedup", result["cases"][-1]["speedup"], flush=True)
 
 
 if __name__ == "__main__":
