@@ -38,6 +38,14 @@ static_assert(INTER_SIZE % (WARPS_PER_CTA * OUTS_PER_WARP) == 0);
 
 using fp8 = __nv_fp8_e4m3;
 
+// Prioritize activations and scales over streaming weight rows in L1.
+__device__ __forceinline__ uint4 load_weight_vector(const fp8* ptr) {
+    uint4 value;
+    asm("ld.global.L1::evict_first.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w) : "l"(ptr));
+    return value;
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float v) {
     // full warp reduction via xor butterfly
     v += __shfl_xor_sync(0xffffffff, v, 16);
@@ -145,8 +153,8 @@ __global__ void moe_gate_up_3d_batched_kernel(
 
         #pragma unroll
         for (int j = 0; j < OUTS_PER_WARP; ++j) {
-            uint4 gv = *reinterpret_cast<const uint4*>(&gate_ptr[j * HIDDEN_SIZE + k]);
-            uint4 uv = *reinterpret_cast<const uint4*>(&up_ptr[j * HIDDEN_SIZE + k]);
+            uint4 gv = load_weight_vector(&gate_ptr[j * HIDDEN_SIZE + k]);
+            uint4 uv = load_weight_vector(&up_ptr[j * HIDDEN_SIZE + k]);
             const auto* g_pairs = reinterpret_cast<const uint16_t*>(&gv);
             const auto* u_pairs = reinterpret_cast<const uint16_t*>(&uv);
             float local_gate = 0.f;
