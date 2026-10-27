@@ -18,7 +18,7 @@ void launch_moe_gate_up_3d_batched(
     const float* w_scale,
     const int*   topk_ids,
     void*        out,
-    int B,
+    int B, int hidden, int inter, int num_experts, int topk,
     cudaStream_t stream);
 
 void launch_moe_down_3d_batched(
@@ -29,7 +29,17 @@ void launch_moe_down_3d_batched(
     const int*   topk_ids,
     const float* topk_scale,
     void*        out,
-    int B,
+    int B, int hidden, int inter, int num_experts, int topk,
+    cudaStream_t stream);
+
+void launch_moe_down_3d_batched_bf16(
+    const void*  buffer,
+    const void*  W,
+    const float* w_scale,
+    const int*   topk_ids,
+    const float* topk_scale,
+    void*        out,
+    int B, int hidden, int inter, int num_experts, int topk,
     cudaStream_t stream);
 
 }  // namespace warp_decode

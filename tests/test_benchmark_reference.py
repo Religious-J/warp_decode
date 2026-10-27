@@ -6,18 +6,10 @@ import torch
 from warp_decode import warp_decode as wd
 from warp_decode.benchmark.bench import (
     initialize_sglang, MoeRunnerConfig, StandardTopKOutput, fused_experts,
-    sglang_per_token_group_quant_fp8,
+    sglang_reference,
 )
-from fp8_reference import make_weights, make_inputs, gate_reference, down_reference, ffn_reference, metrics
+from fp8_reference import make_weights, make_inputs, ffn_reference, metrics
 from test_fp8_blockwise import graph_test
-
-
-def sglang_reference(x, gu, dn, gs, ds, ids, route):
-    # Keep SGLang's quantized inputs, independently evaluate the projections.
-    q, xs = sglang_per_token_group_quant_fp8(x, 128)
-    buf = gate_reference(q, gu, xs, gs, ids)
-    q2, s2 = sglang_per_token_group_quant_fp8(buf, 128)
-    return down_reference(q2, dn, s2, ds, ids, route)
 
 
 def main():
@@ -32,17 +24,26 @@ def main():
         def fn():
             return fused_experts(x, gu, dn, topk, runner, use_fp8_w8a8=True,
                                  w1_scale=gs, w2_scale=ds, block_shape=[128,128])
-        # BF16 GEMM/SiLU rounding can cross FP8 requantization boundaries.
-        # Allow 1% for the full SGLang path; native stage limits are separate.
-        accuracy = metrics(fn(), sglang_reference(x, gu, dn, gs, ds, ids, route), .01)
-        metrics(wd.moe_ffn_3d_batched(x, gu, dn, gs, ds, ids, route),
-                ffn_reference(x, gu, dn, gs, ds, ids, route))
+        # Keep the test's original 1% limit and record the common-reference error.
+        actual = fn()
+        common = ffn_reference(x, gu, dn, gs, ds, ids, route)
+        common_accuracy = metrics(actual, common, .02, check=False)
+        print("SGLang/common reference", b, common_accuracy, flush=True)
+        accuracy = metrics(
+            actual, sglang_reference(x, gu, dn, gs, ds, ids, route), .01,
+        )
+        metrics(wd.moe_ffn_3d_batched(x, gu, dn, gs, ds, ids, route), common)
         def mutate():
             x.mul_(-1.03)
             ids.copy_(ids.roll(1, -1)); route.copy_(route.roll(1, -1))
             gs.mul_(1.001); ds.mul_(.999)
         graph_test(fn, mutate)
-        metrics(fn(), sglang_reference(x, gu, dn, gs, ds, ids, route), .01)
+        actual = fn()
+        graph_common_accuracy = metrics(
+            actual, ffn_reference(x, gu, dn, gs, ds, ids, route), .02, check=False,
+        )
+        print("Graph SGLang/common reference", b, graph_common_accuracy, flush=True)
+        metrics(actual, sglang_reference(x, gu, dn, gs, ds, ids, route), .01)
         print('PASS SGLang FP8 reference + graph', b, accuracy, flush=True)
     print('All SGLang FP8 reference tests passed', flush=True)
 

@@ -1,0 +1,751 @@
+{
+  "aggregation_passed": true,
+  "aggregator_path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/aggregate_final.py",
+  "aggregator_sha256": "180ac5ce81c5f00d4907bf7b8bacc4b2d54193bb9228bc76b95d07e40d5c7b8c",
+  "shape_file": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/shapes.json",
+  "shape_sha256": "cd6b11ac51dd18c82b80c43b62f8aa310e5814f0e4d108a32f8110bcf6f2b2f9",
+  "shapes": {
+    "verified_date": "2026-10-23",
+    "scope": "Eight user-selected Qwen shapes, B=1..8",
+    "layout": "E4M3 W8A8; activation 1x128; weight 128x128; FP32 scales",
+    "batches": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "shape_count": 8,
+    "families": [
+      {
+        "id": "qwen35_36_35b",
+        "models": [
+          "Qwen/Qwen3.5-35B-A3B",
+          "Qwen/Qwen3.6-35B-A3B"
+        ],
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 256,
+        "topk": 8,
+        "tp_to_inter": {
+          "1": 512,
+          "2": 256
+        },
+        "sources": [
+          "https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json",
+          "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/config.json"
+        ]
+      },
+      {
+        "id": "qwen35_122b",
+        "models": [
+          "Qwen/Qwen3.5-122B-A10B"
+        ],
+        "hidden": 3072,
+        "intermediate": 1024,
+        "experts": 256,
+        "topk": 8,
+        "tp_to_inter": {
+          "2": 512,
+          "4": 256
+        },
+        "sources": [
+          "https://huggingface.co/Qwen/Qwen3.5-122B-A10B/blob/main/config.json"
+        ]
+      },
+      {
+        "id": "qwen35_397b",
+        "models": [
+          "Qwen/Qwen3.5-397B-A17B"
+        ],
+        "hidden": 4096,
+        "intermediate": 1024,
+        "experts": 512,
+        "topk": 10,
+        "tp_to_inter": {
+          "4": 256,
+          "8": 128
+        },
+        "sources": [
+          "https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/config.json"
+        ]
+      },
+      {
+        "id": "qwen3_next_80b",
+        "models": [
+          "Qwen/Qwen3-Next-80B-A3B-Instruct",
+          "Qwen/Qwen3-Coder-Next"
+        ],
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "topk": 10,
+        "tp_to_inter": {
+          "1": 512,
+          "2": 256
+        },
+        "sources": [
+          "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json",
+          "https://huggingface.co/Qwen/Qwen3-Coder-Next/blob/main/config.json"
+        ]
+      }
+    ],
+    "excluded_non_aligned_tp": {
+      "qwen3_30b": {
+        "4": 192,
+        "8": 96
+      },
+      "qwen3_235b": {
+        "8": 192
+      },
+      "qwen35_36_35b": {
+        "8": 64
+      },
+      "qwen3_next_80b": {
+        "8": 64
+      }
+    },
+    "alignment_note": "SGLang 0.5.21 NVIDIA Triton blockwise FP8 rejects intermediate_size_per_partition not divisible by block_n/block_k=128. Automatic padding in fused_moe_triton/layer.py applies only to FlashInfer TRTLLM. These cases require separate explicit padding/scale remapping and are not benchmarked as native Triton shapes.",
+    "sglang_alignment_evidence": [
+      "sglang/srt/layers/moe/fused_moe_triton/layer.py:407-428",
+      "sglang/srt/layers/quantization/fp8.py:1398-1415"
+    ],
+    "excluded_this_round": [
+      "qwen3_235b_tp2"
+    ]
+  },
+  "raw_files": [
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_122b_tp2_seed20261023.json",
+      "sha256": "883a5b2e2a33cfd1282a07ad25c2044ba744f2c578106f8cbbbc767a2da070fb",
+      "shape": "qwen35_122b_tp2",
+      "seed": 20261023
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_122b_tp2_seed20261024.json",
+      "sha256": "a4407df8d9ac4f8fd71148abc93aadb0de9a38d4a9265afc4ebe1bbf142f5f36",
+      "shape": "qwen35_122b_tp2",
+      "seed": 20261024
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_122b_tp4_seed20261023.json",
+      "sha256": "64c5e9e99e3faa67b6c0aad22eb84d6fb41c865f8acb131bdf9d64069a78e072",
+      "shape": "qwen35_122b_tp4",
+      "seed": 20261023
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_122b_tp4_seed20261024.json",
+      "sha256": "788a2bfe0405202738d45d72875b80d38eb7391b2e52c89f4e92ebde81119179",
+      "shape": "qwen35_122b_tp4",
+      "seed": 20261024
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_36_35b_tp1_seed20261023.json",
+      "sha256": "10b5988ad8905e7e0c4d96a6e4fab294ea24b895f6761cc74c16db36346d29ba",
+      "shape": "qwen35_36_35b_tp1",
+      "seed": 20261023
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_36_35b_tp1_seed20261024.json",
+      "sha256": "306e9db85ca27b793b96f1bd2673efe6a8dce611be480fab2b2f4c3547c4a3f5",
+      "shape": "qwen35_36_35b_tp1",
+      "seed": 20261024
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_36_35b_tp2_seed20261023.json",
+      "sha256": "d597cd925a2ca42c0fa29376376b682d510fb6e12eeca080f60ccdb960394aa8",
+      "shape": "qwen35_36_35b_tp2",
+      "seed": 20261023
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_36_35b_tp2_seed20261024.json",
+      "sha256": "8a2ae59e993547e3a5fcfdf5007556155ce62bafa89bd9f6c368663d2ab42ec1",
+      "shape": "qwen35_36_35b_tp2",
+      "seed": 20261024
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_397b_tp4_seed20261023.json",
+      "sha256": "f656681de36bc3d9611fe2642e88344d28b5b36e456907aafb2a33be16aafc64",
+      "shape": "qwen35_397b_tp4",
+      "seed": 20261023
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_397b_tp4_seed20261024.json",
+      "sha256": "6e675958d3f4847c02524a8755df03e44521f091971b240a2199ad4fb48035fe",
+      "shape": "qwen35_397b_tp4",
+      "seed": 20261024
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_397b_tp8_seed20261023.json",
+      "sha256": "8fdee46dbaa5d47590c1c7099ddc5eeb4bf0d5ac427c83702165ed0b23e594c0",
+      "shape": "qwen35_397b_tp8",
+      "seed": 20261023
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen35_397b_tp8_seed20261024.json",
+      "sha256": "5e1c812830e0d2d11419e3d0e17e3c2372e3aadbafa27ac136939b95a9591ecc",
+      "shape": "qwen35_397b_tp8",
+      "seed": 20261024
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen3_next_80b_tp1_seed20261023.json",
+      "sha256": "104bc14a5d040c76e2e80b6777a6a799015764b91c8b0dc8f0551cc048d340d4",
+      "shape": "qwen3_next_80b_tp1",
+      "seed": 20261023
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen3_next_80b_tp1_seed20261024.json",
+      "sha256": "06ce46f0c811df5466693b07cb57d5e5685b28d62130aaa303fd470d2637729b",
+      "shape": "qwen3_next_80b_tp1",
+      "seed": 20261024
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen3_next_80b_tp2_seed20261023.json",
+      "sha256": "f14094f152c46971a2740de231adff71983a862974f23ceba3f6c64dcce7764e",
+      "shape": "qwen3_next_80b_tp2",
+      "seed": 20261023
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/qwen3_next_80b_tp2_seed20261024.json",
+      "sha256": "4f0d1828ded6a074d35fef5c95fc56a3455b8a6e6d2462fe84e73fdfcbe9f6d9",
+      "shape": "qwen3_next_80b_tp2",
+      "seed": 20261024
+    },
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw/status.json",
+      "sha256": "27ec4d13530ba84e0824ef0b5b3494ed2fb16bb615d350239e9ad4539ad1dec9",
+      "kind": "status"
+    }
+  ],
+  "runs": [
+    {
+      "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/final_raw",
+      "metadata_sha256": "204ae1719ad17fea3f692cb6f4eefac52554239425554ef891448193d59c8577",
+      "metadata": {
+        "script_sha256": "d8dc0b16a32a5e6aa58196d9f385b23794371c13ea730d47a3f6e2f5879e3d3c",
+        "excluded": "qwen3_235b_tp2",
+        "software": {
+          "torch": "2.13.0+cu130",
+          "cuda": "13.0",
+          "sglang": "0.5.21",
+          "triton": "3.7.1"
+        },
+        "gpu": "NVIDIA H20",
+        "extensions": {
+          "baseline": {
+            "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/baseline/warp_decode_ext.so",
+            "sha256": "420008f4faa6b3febe8700720f1a78fb8fe8dd0047a40cc8fb947cad46875f90"
+          },
+          "optimized": {
+            "path": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/optimized/warp_decode_ext.so",
+            "sha256": "72710141a1532573b10265471808b5d695fc3fb9b706e97c0d208a1c596b3f43"
+          }
+        },
+        "baseline_source_hashes": {
+          "csrc/moe_gate_up_3d_batched.cu": "6ea5f88563507947111fa3a2439e076e2f4ea566e2e3b3403a1b1035471724d5",
+          "csrc/moe_3d_batched.h": "0b93db29780235d6ab7b1083804ea88a0865ecea734df2e9202045955d16b71c",
+          "csrc/moe_down_3d_batched.cu": "868a11691af68924b8785e26e981aa62bb1139a1ebb4c1a170ba81cdfb0fc622",
+          "csrc/binding.cpp": "d843fdbd6223c9a36b55edac9e80ff8c4287080d9ea49ef5b7c4f40d2db44e86"
+        },
+        "reference_hashes": {
+          "benchmark/bench.py": "248b9c86f9ad18d3155f5e30fbceb55d85e1acc6300affd488320d9c8c44524a",
+          "tests/fp8_reference.py": "716b2b7ac51f3f361289fc62d50175d0383bd8e582ecdac287fa0cdab3197833"
+        },
+        "protocol": {
+          "rounds": 5,
+          "replays": 100,
+          "calls_per_graph": 16,
+          "input_batches": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "measured_batches": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "require_bitwise_baseline": true,
+          "weights": "fixed addresses; no cache flush/rotation",
+          "order": "randomized per round",
+          "accuracy": "native .006 / SG own-quant .02; common-reference difference retained",
+          "stages": "isolated native quant/GU/quant/down; identical reference tensors; SG quantizer diagnostics; do not sum stage timings as FFN speedup"
+        }
+      }
+    }
+  ],
+  "case_registry_path": "/workspace/github/warp_decode/benchmark/cases.py",
+  "case_registry_sha256": "1f500882d5949f3c44968a8b919ebe7cdf198aaaa985f77f3014d982fa57a9fd",
+  "case_registry_matches_shape_manifest": true,
+  "calculation": "For each implementation and shape/batch, concatenate five samples from each of two seeds; take the median of ten, then calculate ratios. Seed ratios use their own five-sample medians. All counts use strict >1.30.",
+  "common_reference_policy": "SGLang own-reference .02 is required. Common-reference .02 errors and failures are retained and counted, not used to discard timings.",
+  "output_sha256": {
+    "results.csv": "c136dc35e850c22f2cba552ca3eefa700dbba9de8c4ba58c6ed745ad02c4b374",
+    "results.md": "d280920c3d0ead39be872e28dd18717690d5b5fde64736befc97fbe490e8a68a",
+    "README_RESULTS.md": "bc5937ae5cc3f8070a2492530260b61f6ea5cc7ed3f7eeb6fd72cc01b6dcf6e5",
+    "summary.json": "8bcb8925cdce27bfba8ee9d287ad248f3d990c72b2600b25684e1b7e376f8848"
+  },
+  "validation": {
+    "matrix": [
+      {
+        "case": "qwen35_36_35b_tp1",
+        "seed": 20261023,
+        "returncode": 0,
+        "passed": true,
+        "output": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_36_35b_tp1_seed20261023.json",
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_36_35b_tp1_seed20261023.log"
+      },
+      {
+        "case": "qwen35_36_35b_tp2",
+        "seed": 20261023,
+        "returncode": 0,
+        "passed": true,
+        "output": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_36_35b_tp2_seed20261023.json",
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_36_35b_tp2_seed20261023.log"
+      },
+      {
+        "case": "qwen35_122b_tp2",
+        "seed": 20261023,
+        "returncode": 0,
+        "passed": true,
+        "output": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_122b_tp2_seed20261023.json",
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_122b_tp2_seed20261023.log"
+      },
+      {
+        "case": "qwen35_122b_tp4",
+        "seed": 20261023,
+        "returncode": 0,
+        "passed": true,
+        "output": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_122b_tp4_seed20261023.json",
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_122b_tp4_seed20261023.log"
+      },
+      {
+        "case": "qwen35_397b_tp4",
+        "seed": 20261023,
+        "returncode": 0,
+        "passed": true,
+        "output": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_397b_tp4_seed20261023.json",
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_397b_tp4_seed20261023.log"
+      },
+      {
+        "case": "qwen35_397b_tp8",
+        "seed": 20261023,
+        "returncode": 0,
+        "passed": true,
+        "output": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_397b_tp8_seed20261023.json",
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen35_397b_tp8_seed20261023.log"
+      },
+      {
+        "case": "qwen3_next_80b_tp1",
+        "seed": 20261023,
+        "returncode": 0,
+        "passed": true,
+        "output": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen3_next_80b_tp1_seed20261023.json",
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen3_next_80b_tp1_seed20261023.log"
+      },
+      {
+        "case": "qwen3_next_80b_tp2",
+        "seed": 20261023,
+        "returncode": 0,
+        "passed": true,
+        "output": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen3_next_80b_tp2_seed20261023.json",
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation/test/qwen3_next_80b_tp2_seed20261023.log"
+      }
+    ],
+    "extra": [
+      {
+        "name": "generic_fallback",
+        "command": [
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_fp8_blockwise.py",
+          "--hidden",
+          "1408",
+          "--inter",
+          "1152",
+          "--experts",
+          "32",
+          "--topk",
+          "7",
+          "--batches",
+          "0,1,8,9",
+          "--output",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/generic_fallback.json"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 2.9498531818389893,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/generic_fallback.log"
+      },
+      {
+        "name": "original_large_batch",
+        "command": [
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_fp8_blockwise.py",
+          "--case",
+          "qwen35_36_35b_tp1",
+          "--batches",
+          "16,32,64",
+          "--output",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/original_large_batch.json"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 3.0554778575897217,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/original_large_batch.log"
+      },
+      {
+        "name": "sglang_reference",
+        "command": [
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_benchmark_reference.py"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 9.949607849121094,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/sglang_reference.log"
+      },
+      {
+        "name": "benchmark_cli",
+        "command": [
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/benchmark/bench_qwen.py",
+          "--mode",
+          "bench",
+          "--cases",
+          "qwen35_36_35b_tp2",
+          "--seeds",
+          "20261023",
+          "--batches",
+          "1,8",
+          "--rounds",
+          "1",
+          "--iters",
+          "5",
+          "--output-dir",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/cli_smoke"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 9.867628335952759,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/benchmark_cli.log"
+      },
+      {
+        "name": "memcheck_qwen35_122b_tp2",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "99",
+          "--kernel-name",
+          "kns=warp_decode",
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_fp8_blockwise.py",
+          "--case",
+          "qwen35_122b_tp2",
+          "--batches",
+          "1,4,8",
+          "--sanitizer",
+          "--output",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/memcheck_qwen35_122b_tp2.json"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 4.5145299434661865,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/memcheck_qwen35_122b_tp2.log"
+      },
+      {
+        "name": "memcheck_qwen35_397b_tp4",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "99",
+          "--kernel-name",
+          "kns=warp_decode",
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_fp8_blockwise.py",
+          "--case",
+          "qwen35_397b_tp4",
+          "--batches",
+          "1,4,8",
+          "--sanitizer",
+          "--output",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/memcheck_qwen35_397b_tp4.json"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 4.369270324707031,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/memcheck_qwen35_397b_tp4.log"
+      },
+      {
+        "name": "memcheck_qwen35_397b_tp8",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "99",
+          "--kernel-name",
+          "kns=warp_decode",
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_fp8_blockwise.py",
+          "--case",
+          "qwen35_397b_tp8",
+          "--batches",
+          "1,4,8",
+          "--sanitizer",
+          "--output",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/memcheck_qwen35_397b_tp8.json"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 4.267035722732544,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/memcheck_qwen35_397b_tp8.log"
+      },
+      {
+        "name": "racecheck_qwen35_122b_tp2",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "racecheck",
+          "--error-exitcode",
+          "99",
+          "--kernel-name",
+          "kns=warp_decode",
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_fp8_blockwise.py",
+          "--case",
+          "qwen35_122b_tp2",
+          "--batches",
+          "1,4,8",
+          "--sanitizer",
+          "--output",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/racecheck_qwen35_122b_tp2.json"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 6.781290054321289,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/racecheck_qwen35_122b_tp2.log"
+      },
+      {
+        "name": "racecheck_qwen35_397b_tp4",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "racecheck",
+          "--error-exitcode",
+          "99",
+          "--kernel-name",
+          "kns=warp_decode",
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_fp8_blockwise.py",
+          "--case",
+          "qwen35_397b_tp4",
+          "--batches",
+          "1,4,8",
+          "--sanitizer",
+          "--output",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/racecheck_qwen35_397b_tp4.json"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 7.063692569732666,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/racecheck_qwen35_397b_tp4.log"
+      },
+      {
+        "name": "racecheck_qwen35_397b_tp8",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "racecheck",
+          "--error-exitcode",
+          "99",
+          "--kernel-name",
+          "kns=warp_decode",
+          "/workspace/venvs/warp-decode-sglang-0.5.21/bin/python",
+          "/workspace/github/warp_decode/tests/test_fp8_blockwise.py",
+          "--case",
+          "qwen35_397b_tp8",
+          "--batches",
+          "1,4,8",
+          "--sanitizer",
+          "--output",
+          "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/racecheck_qwen35_397b_tp8.json"
+        ],
+        "passed": true,
+        "returncode": 0,
+        "seconds": 6.868664264678955,
+        "log": "/workspace/github/warp_decode/experiments/qwen-focus-20261026/validation_extra/racecheck_qwen35_397b_tp8.log"
+      }
+    ],
+    "baseline_manifest_unchanged": true,
+    "production_matches_tested_snapshot": true,
+    "summary": {
+      "aggregation_passed": true,
+      "shape_count": 8,
+      "case_count": 64,
+      "raw_case_count": 128,
+      "run_count": 16,
+      "samples_per_implementation_per_case": 10,
+      "seeds": [
+        20261023,
+        20261024
+      ],
+      "batches": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "selected_cases": [
+        "qwen35_36_35b_tp1",
+        "qwen35_36_35b_tp2",
+        "qwen35_122b_tp2",
+        "qwen35_122b_tp4",
+        "qwen35_397b_tp4",
+        "qwen35_397b_tp8",
+        "qwen3_next_80b_tp1",
+        "qwen3_next_80b_tp2"
+      ],
+      "scope": "Eight named Qwen shapes; B1..8",
+      "validation_failures": 0,
+      "own_reference_and_graph_checks_all_passed": true,
+      "bitwise_baseline_all_passed": true,
+      "bitwise_baseline_checks": 128,
+      "sglang_common_reference_failures": {
+        "observation_count": 0,
+        "raw_case_count": 0,
+        "observations": []
+      },
+      "comparisons": {
+        "baseline_to_optimized_speedup": {
+          "geometric_mean": 1.031972753859434,
+          "minimum": 0.9867653598939287,
+          "maximum": 1.1414602448910478,
+          "strict_gt_1_30": 0,
+          "strict_gt_1": 55,
+          "strict_lt_1": 9,
+          "count": 64,
+          "both_seeds_strict_gt_1_30": 0,
+          "by_seed": {
+            "20261023": {
+              "geometric_mean": 1.03158607971002,
+              "minimum": 0.9773436114046989,
+              "maximum": 1.141991884072754,
+              "strict_gt_1_30": 0,
+              "strict_gt_1": 54,
+              "strict_lt_1": 10,
+              "count": 64
+            },
+            "20261024": {
+              "geometric_mean": 1.0318226075196673,
+              "minimum": 0.9524600401922443,
+              "maximum": 1.144817092356348,
+              "strict_gt_1_30": 0,
+              "strict_gt_1": 56,
+              "strict_lt_1": 8,
+              "count": 64
+            }
+          }
+        },
+        "sglang_speedup": {
+          "geometric_mean": 1.4987288766624676,
+          "minimum": 0.9627523093924633,
+          "maximum": 3.608909974612193,
+          "strict_gt_1_30": 41,
+          "strict_gt_1": 63,
+          "strict_lt_1": 1,
+          "count": 64,
+          "both_seeds_strict_gt_1_30": 40,
+          "by_seed": {
+            "20261023": {
+              "geometric_mean": 1.5033905353162025,
+              "minimum": 0.9668048726792398,
+              "maximum": 3.6307752800220228,
+              "strict_gt_1_30": 43,
+              "strict_gt_1": 62,
+              "strict_lt_1": 2,
+              "count": 64
+            },
+            "20261024": {
+              "geometric_mean": 1.4928176635431667,
+              "minimum": 0.9476334635695332,
+              "maximum": 3.574288753171929,
+              "strict_gt_1_30": 41,
+              "strict_gt_1": 63,
+              "strict_lt_1": 1,
+              "count": 64
+            }
+          }
+        },
+        "baseline_sglang_speedup": {
+          "geometric_mean": 1.4522950059073079,
+          "minimum": 0.9174946885123446,
+          "maximum": 3.407121965051644,
+          "strict_gt_1_30": 34,
+          "strict_gt_1": 62,
+          "strict_lt_1": 2,
+          "count": 64,
+          "both_seeds_strict_gt_1_30": 34,
+          "by_seed": {
+            "20261023": {
+              "geometric_mean": 1.4573582998898233,
+              "minimum": 0.9175591268957916,
+              "maximum": 3.4177473259334006,
+              "strict_gt_1_30": 35,
+              "strict_gt_1": 62,
+              "strict_lt_1": 2,
+              "count": 64
+            },
+            "20261024": {
+              "geometric_mean": 1.4467774331206564,
+              "minimum": 0.9176275748217312,
+              "maximum": 3.4229474734129104,
+              "strict_gt_1_30": 34,
+              "strict_gt_1": 61,
+              "strict_lt_1": 3,
+              "count": 64
+            }
+          }
+        }
+      }
+    }
+  },
+  "production_source_hashes": {
+    "csrc/moe_gate_up_3d_batched.cu": "fcae0c3dc2f4badaae0bc48639cd5ef87dbe949d0044813f9a023448b448d440",
+    "csrc/moe_3d_batched.h": "0b93db29780235d6ab7b1083804ea88a0865ecea734df2e9202045955d16b71c",
+    "csrc/moe_down_3d_batched.cu": "381af5b14ebc8ff085c70a990f45c92a717041886f1308269b5c1e691d0adeef",
+    "csrc/binding.cpp": "4f2a4f77e487f9671b82426bed81685ebc847108cb8219b83cbb411ff26468e4",
+    "__init__.py": "ad1866b55fc0ee49cdd2b00ec294ddee37e083242d53870eb7c3cd044d83daf2",
+    "benchmark/cases.py": "1f500882d5949f3c44968a8b919ebe7cdf198aaaa985f77f3014d982fa57a9fd",
+    "benchmark/bench_qwen.py": "2cd5364defd8e3ef9a98b495f68277b3b10337bad4d3902eae8fd18c4bbfd8ec",
+    "benchmark/bench.py": "b4490d511ccd40990dee05ae29d5f7f3758654ad0ce8a906b3c5384e0948ec21",
+    "tests/test_fp8_blockwise.py": "8f2d601b09a69d93f05cccaffc06806edf4d7b6d7e6706887ac73e7959bd504a",
+    "tests/fp8_reference.py": "716b2b7ac51f3f361289fc62d50175d0383bd8e582ecdac287fa0cdab3197833",
+    "tests/test_benchmark_reference.py": "cc14ed9e11628dcaa116960d4c93f21545306adfbfa57f4e1f9e94e220ce5454"
+  },
+  "git": {
+    "branch": "codex/qwen36-blockwise-fp8",
+    "head": "7711a9877a8be58526aeb4dea6639736ec63c9d4",
+    "baseline": "Frozen working tree at the start of this round, not main or HEAD"
+  }
+}
